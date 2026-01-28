@@ -4,6 +4,7 @@ main.js.map
 .DS_Store
 .tmp/
 Year 4C/
+data.json
 *.log
 npm-debug.log*
 pnpm-debug.log*
