@@ -1,0 +1,23 @@
+---
+title: Flumazenil
+rank: 3
+status: not-started
+topic: Psychiatric Treatment and Management
+subtopic: Medications for Substance Abuse
+---
+
+## Definition
+### Buzzwords
+
+## Aetiology
+### Causes
+### Causes of Acute Exacerbations
+
+## Clinical Features
+### Discriminating Features
+
+## Case History
+
+## Appropriate Investigations
+
+## Differential Diagnosis

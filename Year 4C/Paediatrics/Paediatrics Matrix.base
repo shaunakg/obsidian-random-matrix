@@ -1,0 +1,32 @@
+summaries:
+  "%": (100*(values.filter(value == true).length / values.length)).round(2)
+formulas:
+  status: status == "finished"
+properties:
+  note.rank:
+    displayName: r
+  formula.status:
+    displayName: s
+views:
+  - type: table
+    name: Table
+    filters:
+      and:
+        - file.folder.contains("Year 4C/Paediatrics")
+    groupBy:
+      property: topic
+      direction: ASC
+    order:
+      - rank
+      - formula.status
+      - file.name
+    sort:
+      - property: rank
+        direction: ASC
+      - property: file.name
+        direction: ASC
+    summaries:
+      formula.status: "%"
+    columnSize:
+      note.rank: -4
+      formula.status: -49
