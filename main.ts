@@ -132,11 +132,11 @@ const DEFAULT_SETTINGS: RandomMatrixSettings = {
   topicField: "topic",
   subtopicField: "subtopic",
 
-  completedStatuses: ["completed", "done", "complete", "mastered"],
+  completedStatuses: ["finished", "done", "complete", "mastered"],
   notStartedStatuses: ["not-started", "todo", "new"],
   inProgressStatuses: ["in-progress", "doing", "started"],
 
-  markCompletedValue: "completed",
+  markCompletedValue: "finished",
   markInProgressValue: "in-progress",
   markNotStartedValue: "not-started",
 
@@ -331,8 +331,13 @@ export default class RandomMatrixPlugin extends Plugin {
 
   normalizeSettings() {
     this.settings.completedStatuses = normalizeList(this.settings.completedStatuses);
+    if (!this.settings.completedStatuses.includes("finished")) {
+      this.settings.completedStatuses.unshift("finished");
+    }
     this.settings.notStartedStatuses = normalizeList(this.settings.notStartedStatuses);
     this.settings.inProgressStatuses = normalizeList(this.settings.inProgressStatuses);
+    const markCompletedValue = normalizeStatus(this.settings.markCompletedValue);
+    this.settings.markCompletedValue = markCompletedValue || "finished";
     this.settings.excludePathFragments = (this.settings.excludePathFragments || []).filter(
       (value) => value.trim().length > 0
     );
@@ -1144,7 +1149,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
         text
           .setValue(this.plugin.settings.markCompletedValue)
           .onChange(async (value) => {
-            this.plugin.settings.markCompletedValue = value.trim() || "completed";
+            this.plugin.settings.markCompletedValue = value.trim() || "finished";
             await this.plugin.savePluginData();
           })
       );

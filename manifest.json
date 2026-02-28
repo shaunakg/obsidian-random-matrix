@@ -1,7 +1,7 @@
 {
   "id": "obsidian-random-matrix",
   "name": "Random Matrix",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "minAppVersion": "1.4.0",
   "description": "Smart random picker for matrix notes based on rank and status.",
   "author": "shaunakg",
