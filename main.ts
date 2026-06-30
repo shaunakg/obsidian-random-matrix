@@ -338,8 +338,7 @@ export default class RandomMatrixPlugin extends Plugin {
     this.settings.notStartedStatuses = normalizeList(this.settings.notStartedStatuses);
     this.settings.inProgressStatuses = normalizeList(this.settings.inProgressStatuses);
     const markCompletedValue = normalizeStatus(this.settings.markCompletedValue);
-    this.settings.markCompletedValue =
-      markCompletedValue === "completed" ? FINISHED_STATUS : markCompletedValue || FINISHED_STATUS;
+    this.settings.markCompletedValue = markCompletedValue || FINISHED_STATUS;
     this.settings.excludePathFragments = (this.settings.excludePathFragments || []).filter(
       (value) => value.trim().length > 0
     );
@@ -1152,8 +1151,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.markCompletedValue)
           .onChange(async (value) => {
             const nextValue = normalizeStatus(value);
-            this.plugin.settings.markCompletedValue =
-              nextValue === "completed" ? FINISHED_STATUS : nextValue || FINISHED_STATUS;
+            this.plugin.settings.markCompletedValue = nextValue || FINISHED_STATUS;
             await this.plugin.savePluginData();
           })
       );
