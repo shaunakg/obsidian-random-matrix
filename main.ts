@@ -12,6 +12,7 @@ import {
 } from "obsidian";
 
 const VIEW_TYPE = "random-matrix-view";
+const FINISHED_STATUS = "finished";
 
 interface RandomMatrixSettings {
   targetFolder: string;
@@ -132,11 +133,11 @@ const DEFAULT_SETTINGS: RandomMatrixSettings = {
   topicField: "topic",
   subtopicField: "subtopic",
 
-  completedStatuses: ["finished", "done", "complete", "mastered"],
+  completedStatuses: [FINISHED_STATUS, "done", "complete", "mastered"],
   notStartedStatuses: ["not-started", "todo", "new"],
   inProgressStatuses: ["in-progress", "doing", "started"],
 
-  markCompletedValue: "finished",
+  markCompletedValue: FINISHED_STATUS,
   markInProgressValue: "in-progress",
   markNotStartedValue: "not-started",
 
@@ -331,13 +332,14 @@ export default class RandomMatrixPlugin extends Plugin {
 
   normalizeSettings() {
     this.settings.completedStatuses = normalizeList(this.settings.completedStatuses);
-    if (!this.settings.completedStatuses.includes("finished")) {
-      this.settings.completedStatuses.unshift("finished");
+    if (!this.settings.completedStatuses.includes(FINISHED_STATUS)) {
+      this.settings.completedStatuses.unshift(FINISHED_STATUS);
     }
     this.settings.notStartedStatuses = normalizeList(this.settings.notStartedStatuses);
     this.settings.inProgressStatuses = normalizeList(this.settings.inProgressStatuses);
     const markCompletedValue = normalizeStatus(this.settings.markCompletedValue);
-    this.settings.markCompletedValue = markCompletedValue || "finished";
+    this.settings.markCompletedValue =
+      markCompletedValue === "completed" ? FINISHED_STATUS : markCompletedValue || FINISHED_STATUS;
     this.settings.excludePathFragments = (this.settings.excludePathFragments || []).filter(
       (value) => value.trim().length > 0
     );
@@ -1149,7 +1151,9 @@ class RandomMatrixSettingTab extends PluginSettingTab {
         text
           .setValue(this.plugin.settings.markCompletedValue)
           .onChange(async (value) => {
-            this.plugin.settings.markCompletedValue = value.trim() || "finished";
+            const nextValue = normalizeStatus(value);
+            this.plugin.settings.markCompletedValue =
+              nextValue === "completed" ? FINISHED_STATUS : nextValue || FINISHED_STATUS;
             await this.plugin.savePluginData();
           })
       );
