@@ -794,7 +794,7 @@ class RandomMatrixView extends ItemView {
       const chip = row.createEl("button", { cls: "rmv-chip" });
       chip.createSpan({ text: area });
       if (r1 && r1.total > 0) {
-        chip.createSpan({ text: ` ${r1.done}/${r1.total}`, cls: "rmv-chip-count" });
+        chip.createSpan({ text: `${r1.done}/${r1.total}`, cls: "rmv-chip-count" });
       }
       chip.toggleClass("is-active", focus.includes(area));
       chip.setAttr(
@@ -963,7 +963,8 @@ class RandomMatrixSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
-  private update(apply: () => void, reindex = false) {
+  // Not named "update": SettingTab has its own update() that Obsidian calls.
+  private saveSetting(apply: () => void, reindex = false) {
     apply();
     if (reindex) {
       this.plugin.rebuildIndex();
@@ -985,7 +986,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
         text
           .setPlaceholder("Year 4C")
           .setValue(settings.matrixFolder)
-          .onChange((value) => this.update(() => (settings.matrixFolder = value.trim()), true))
+          .onChange((value) => this.saveSetting(() => (settings.matrixFolder = value.trim()), true))
       )
       .addExtraButton((button) =>
         button
@@ -993,7 +994,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setTooltip("Browse")
           .onClick(() => {
             new FolderSuggestModal(this.app, (folder) => {
-              this.update(() => (settings.matrixFolder = folder.path), true);
+              this.saveSetting(() => (settings.matrixFolder = folder.path), true);
               this.display();
             }).open();
           })
@@ -1008,7 +1009,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
         text.inputEl.type = "date";
         text
           .setValue(settings.examDate)
-          .onChange((value) => this.update(() => (settings.examDate = value)));
+          .onChange((value) => this.saveSetting(() => (settings.examDate = value)));
       });
 
     new Setting(containerEl)
@@ -1019,7 +1020,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setLimits(0.5, 15, 0.5)
           .setDynamicTooltip()
           .setValue(settings.dailyTarget)
-          .onChange((value) => this.update(() => (settings.dailyTarget = value)))
+          .onChange((value) => this.saveSetting(() => (settings.dailyTarget = value)))
       );
 
     new Setting(containerEl).setName("Picking").setHeading();
@@ -1033,7 +1034,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .setValue(settings.choiceCount)
           .onChange((value) =>
-            this.update(() => {
+            this.saveSetting(() => {
               settings.choiceCount = value;
               plugin.state.choices = plugin.state.choices.slice(0, value);
             })
@@ -1048,7 +1049,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setLimits(0, 1, 0.05)
           .setDynamicTooltip()
           .setValue(settings.rank2Weight)
-          .onChange((value) => this.update(() => (settings.rank2Weight = value)))
+          .onChange((value) => this.saveSetting(() => (settings.rank2Weight = value)))
       );
 
     new Setting(containerEl)
@@ -1058,7 +1059,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setLimits(0, 1, 0.05)
           .setDynamicTooltip()
           .setValue(settings.rank3Weight)
-          .onChange((value) => this.update(() => (settings.rank3Weight = value)))
+          .onChange((value) => this.saveSetting(() => (settings.rank3Weight = value)))
       );
 
     new Setting(containerEl)
@@ -1068,7 +1069,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setLimits(1, 14, 1)
           .setDynamicTooltip()
           .setValue(settings.snoozeDays)
-          .onChange((value) => this.update(() => (settings.snoozeDays = value)))
+          .onChange((value) => this.saveSetting(() => (settings.snoozeDays = value)))
       );
 
     new Setting(containerEl).setName("Frontmatter").setHeading();
@@ -1079,7 +1080,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setPlaceholder(DEFAULT_SETTINGS[key])
           .setValue(settings[key])
           .onChange((value) =>
-            this.update(() => (settings[key] = value.trim() || DEFAULT_SETTINGS[key]), true)
+            this.saveSetting(() => (settings[key] = value.trim() || DEFAULT_SETTINGS[key]), true)
           )
       );
     field("Rank field", "rankField");
