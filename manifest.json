@@ -1,7 +1,7 @@
 {
   "id": "obsidian-random-matrix",
   "name": "Random Matrix",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "minAppVersion": "1.4.0",
   "description": "Takes the decision out of what to study next: offers a few weighted picks from your matrix notes, paced to your exam date.",
   "author": "shaunakg",

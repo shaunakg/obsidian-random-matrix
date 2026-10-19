@@ -6,19 +6,25 @@ Random Matrix takes the decision out of "what should I study next?" when you hav
 
 The panel (dice icon in the ribbon) has three parts:
 
-- **Focus chips**: one per top-level folder under your matrix folder (e.g. GP, O&G, Paediatrics, Psychiatry), with rank 1 finished/total. Tap one to study only that rotation; shift-click to combine. "All" clears the focus.
+- **Focus chips**: one per top-level folder under your matrix folder (e.g. GP, O&G, Paediatrics, Psychiatry), with the share of that rotation's past exam questions you've covered (or rank 1 finished/total without exam yield). Tap one to study only that rotation; shift-click to combine. "All" clears the focus.
 - **Pick one**: three options by default, drawn so they come from different rotations and topics. Tap one to open it and make it your current note. **Pick for me** chooses one of them for you; **Shuffle** passes on all three and shows a new set (passed notes don't come back for 45 minutes, then return gradually over a day).
 - **Studying**: the note you're on. **Finished** sets its status and brings back the choices. **Snooze** hides it for a couple of days. **Put back** returns it to the pool without finishing it.
 
 Underneath is your progress per rank, how many you've finished today and this week, and (with an exam date set) the daily rate needed to finish rank 1.
 
+### Exam yield
+
+If notes have an `exam_yield` property (expected questions per 100 on past papers, from the exam-yield pipeline), picking is driven by it: a note's priority is its yield plus a small boost for matrix rank (R1 +0.1, R2 +0.03, R3 +0.01), so heavily examined notes come up most and an unexamined rank 1 still beats an unexamined rank 3. Cards show the exam tier (`E1`–`E4`, from `exam_rank`); hover for the yield and how many past papers it appeared in. The progress section leads with **Exam**: the share of past exam questions your finished notes cover, and focus chips show the same per rotation. Turn this off in settings to rank by matrix rank alone.
+
 ### Exam plan
 
-Set an exam date and how many conditions you can realistically finish per day. That gives a capacity (days left × per day), which is spent on rank 1 first, then rank 2, then rank 3. If rank 1 alone exceeds your capacity, only rank 1 comes up. Without an exam date, rank 2 and 3 are mixed in by their weights (0.3 and 0.1 relative to rank 1 by default).
+Set an exam date and how many conditions you can realistically finish per day. That gives a capacity (days left × per day). The plan is the highest-priority unfinished notes that fit in it, and only those come up (notes tied at the cut-off share the remaining slots). With exam yield, the panel shows how much of the past exams finishing the plan would cover, and the daily rate needed to reach 80%. Without it, priority is matrix rank (rank 2 and 3 weighted 0.3 and 0.1 by default), so rank 1 fills the plan first.
+
+If a focused rotation has fewer than five notes in the plan, or the plan's remaining notes are all on cooldown, choices fall back to the best notes outside it.
 
 ### What makes a note more or less likely
 
-- Its rank's share of the plan, spread across the remaining notes of that rank.
+- Its priority (above), within the plan.
 - **In progress** notes get a small boost (×1.25), so started work gets finished.
 - **Recently opened**: hidden for 6 hours, then down-weighted and recovering over a few days.
 - **Recently passed on**: hidden for 45 minutes, then down-weighted and recovering over about a day.
@@ -39,8 +45,9 @@ Finished notes and snoozed notes are never offered. Completions are logged whene
 - **Matrix folder**: notes inside it with a rank field are the matrix.
 - **Exam date**, **Conditions per day**: the exam plan above.
 - **Choices offered**: 1–5. Set to 1 for a single pick.
-- **Rank 2 / Rank 3 weight**, **Snooze length**
-- **Frontmatter**: field names for rank, status, topic and subtopic, and the status values written for finished and in progress. `finished`, `done`, `complete`, `completed` and `mastered` all count as finished.
+- **Prioritise by exam yield**: on by default; uses `exam_yield` when notes have it.
+- **Rank 2 / Rank 3 weight** (used without exam yield), **Snooze length**
+- **Frontmatter**: field names for rank, status, topic and subtopic, and the status values written for finished and in progress. `finished`, `done`, `complete`, `completed` and `mastered` all count as finished. The exam yield field name is configurable too.
 
 ## Development
 

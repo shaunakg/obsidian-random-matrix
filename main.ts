@@ -17,17 +17,18 @@ import {
   Condition,
   DAY_MS,
   PassRecord,
+  Plan,
   PlanSettings,
   RANKS,
   Rank,
-  RankPlan,
   Status,
-  countRemaining,
+  coverage,
   drawChoices,
-  effectivePlan,
   isAvailable,
-  planRanks,
+  makePlan,
+  paceForCoverage,
   recentTopics,
+  scopedPlan,
   startOfDay,
   weightOf,
   weightedIndex,
@@ -37,6 +38,10 @@ const VIEW_TYPE = "random-matrix-view";
 const FINISHED_STATUSES = ["finished", "done", "complete", "completed", "mastered"];
 const IN_PROGRESS_STATUSES = ["in-progress", "doing", "started"];
 const PASSED_RETENTION_MS = 30 * DAY_MS;
+const EXAM_TIER_FIELD = "exam_rank";
+const EXAM_SITTINGS_FIELD = "exam_sittings";
+/** Coverage the pace line aims for: past this, extra notes add little. */
+const COVERAGE_TARGET = 0.8;
 
 interface RandomMatrixSettings {
   matrixFolder: string;
@@ -45,6 +50,7 @@ interface RandomMatrixSettings {
   choiceCount: number;
   rank2Weight: number;
   rank3Weight: number;
+  useExamYield: boolean;
   snoozeDays: number;
 
   rankField: string;
@@ -53,6 +59,7 @@ interface RandomMatrixSettings {
   subtopicField: string;
   finishedValue: string;
   inProgressValue: string;
+  examYieldField: string;
 }
 
 interface RandomMatrixState {
@@ -100,6 +107,9 @@ interface RankStats {
 interface MatrixStats {
   byRank: Record<Rank, RankStats>;
   byArea: Map<string, Record<Rank, RankStats>>;
+  /** Share of past exam questions covered by finished notes, if yield is known. */
+  coverage: number | null;
+  areaCoverage: Map<string, number | null>;
   today: number;
   last7: number;
 }
@@ -115,6 +125,7 @@ const DEFAULT_SETTINGS: RandomMatrixSettings = {
   choiceCount: 3,
   rank2Weight: 0.3,
   rank3Weight: 0.1,
+  useExamYield: true,
   snoozeDays: 2,
 
   rankField: "rank",
@@ -123,6 +134,7 @@ const DEFAULT_SETTINGS: RandomMatrixSettings = {
   subtopicField: "subtopic",
   finishedValue: "finished",
   inProgressValue: "in-progress",
+  examYieldField: "exam_yield",
 };
 
 function defaultState(): RandomMatrixState {
@@ -362,6 +374,9 @@ export default class RandomMatrixPlugin extends Plugin {
       area: relative.length > 1 ? relative[0] : "",
       topic: asString(fm[this.settings.topicField]),
       subtopic: asString(fm[this.settings.subtopicField]),
+      examYield: asNumber(fm[this.settings.examYieldField]),
+      examTier: asNumber(fm[EXAM_TIER_FIELD]),
+      examSittings: asNumber(fm[EXAM_SITTINGS_FIELD]),
     };
   }
 
@@ -473,11 +488,12 @@ export default class RandomMatrixPlugin extends Plugin {
       dailyTarget: this.settings.dailyTarget,
       rank2Weight: this.settings.rank2Weight,
       rank3Weight: this.settings.rank3Weight,
+      useExamYield: this.settings.useExamYield,
     };
   }
 
-  plan(now = Date.now()): RankPlan {
-    return planRanks(countRemaining(this.conditions.values()), this.planSettings(), now);
+  plan(now = Date.now()): Plan {
+    return makePlan([...this.conditions.values()], this.planSettings(), now);
   }
 
   /** Current note, cleared if it has since been finished, snoozed or removed. */
@@ -499,10 +515,16 @@ export default class RandomMatrixPlugin extends Plugin {
   /** Choices on offer, topped up to the configured count. */
   choices(): Condition[] {
     const now = Date.now();
+    const scoped = [...this.conditions.values()].filter((c) => this.inFocus(c));
+    const plan = scopedPlan(this.plan(now), scoped, this.planSettings(), now);
     const kept = this.state.choices
       .map((p) => this.conditions.get(p))
       .filter((c): c is Condition => {
         if (!c || !this.inFocus(c) || c.status === "finished") {
+          return false;
+        }
+        // Drop choices the plan no longer includes (new exam date, new yield data).
+        if (plan.priorityOf(c) <= 0) {
           return false;
         }
         return (this.state.snoozedUntil[c.path] ?? 0) <= now;
@@ -523,10 +545,8 @@ export default class RandomMatrixPlugin extends Plugin {
   private draw(count: number, now: number, exclude: Set<string>): Condition[] {
     const all = [...this.conditions.values()];
     const scoped = all.filter((c) => this.inFocus(c));
-    const scopeRemaining = countRemaining(scoped);
     const ctx = {
-      plan: effectivePlan(this.plan(now), scopeRemaining, this.planSettings()),
-      scopeRemaining,
+      plan: scopedPlan(this.plan(now), scoped, this.planSettings(), now),
       state: this.state,
       recent: recentTopics(this.state, (p) => this.conditions.get(p)),
       now,
@@ -538,7 +558,15 @@ export default class RandomMatrixPlugin extends Plugin {
         (c) => c.status !== "finished" && (this.state.snoozedUntil[c.path] ?? 0) <= now
       );
     }
-    return drawChoices(candidates, (c) => weightOf(c, ctx), count, Math.random, exclude);
+    const loose = { ...ctx, plan: makePlan(scoped, { ...this.planSettings(), examDate: "" }, now) };
+    return drawChoices(
+      candidates,
+      (c) => weightOf(c, ctx),
+      count,
+      Math.random,
+      exclude,
+      (c) => weightOf(c, loose)
+    );
   }
 
   /** Pass on everything shown and offer a fresh set. */
@@ -677,7 +705,12 @@ export default class RandomMatrixPlugin extends Plugin {
         last7 += 1;
       }
     }
-    return { byRank, byArea, today, last7 };
+    const all = [...this.conditions.values()];
+    const areaCoverage = new Map<string, number | null>();
+    for (const area of byArea.keys()) {
+      areaCoverage.set(area, coverage(all.filter((c) => c.area === area)));
+    }
+    return { byRank, byArea, coverage: coverage(all), areaCoverage, today, last7 };
   }
 
   // ---------------------------------------------------------------------------
@@ -789,17 +822,23 @@ class RandomMatrixView extends ItemView {
     all.toggleClass("is-active", focus.length === 0);
     all.onclick = () => this.setFocus([]);
 
+    const byYield = this.plugin.plan().byYield;
     for (const area of areas) {
       const r1 = stats.byArea.get(area)?.[1];
+      const covered = stats.areaCoverage.get(area) ?? null;
       const chip = row.createEl("button", { cls: "rmv-chip" });
       chip.createSpan({ text: area });
-      if (r1 && r1.total > 0) {
+      if (byYield && covered !== null) {
+        chip.createSpan({ text: formatPercent(covered), cls: "rmv-chip-count" });
+      } else if (r1 && r1.total > 0) {
         chip.createSpan({ text: `${r1.done}/${r1.total}`, cls: "rmv-chip-count" });
       }
       chip.toggleClass("is-active", focus.includes(area));
       chip.setAttr(
         "aria-label",
-        "Rank 1 finished/total. Shift-click to combine with other rotations."
+        (byYield && covered !== null
+          ? "Share of this rotation's past exam questions your finished notes cover."
+          : "Rank 1 finished/total.") + " Shift-click to combine with other rotations."
       );
       chip.onclick = (event) => {
         if (event.shiftKey || event.metaKey || event.ctrlKey) {
@@ -901,6 +940,13 @@ class RandomMatrixView extends ItemView {
     const head = card.createDiv({ cls: "rmv-card-head" });
     head.createSpan({ text: `R${c.rank}`, cls: `rmv-rank rmv-rank-${c.rank}` });
     head.createSpan({ text: c.title, cls: "rmv-card-title" });
+    if (c.examTier !== null && this.plugin.settings.useExamYield) {
+      const tier = head.createSpan({
+        text: `E${c.examTier}`,
+        cls: `rmv-exam rmv-exam-${Math.min(4, Math.max(1, c.examTier))}`,
+      });
+      tier.setAttr("aria-label", describeExam(c));
+    }
 
     const meta = card.createDiv({ cls: "rmv-card-meta" });
     const crumbs = [c.area, c.topic, c.subtopic].filter((s) => s && s.length > 0);
@@ -918,6 +964,15 @@ class RandomMatrixView extends ItemView {
     const plugin = this.plugin;
     const plan = plugin.plan();
     const section = root.createDiv({ cls: "rmv-section rmv-progress" });
+
+    if (plan.byYield && stats.coverage !== null) {
+      const row = section.createDiv({ cls: "rmv-bar-row rmv-bar-row-exam" });
+      row.createSpan({ text: "Exam", cls: "rmv-rank" });
+      const bar = row.createDiv({ cls: "rmv-bar" });
+      bar.createDiv({ cls: "rmv-bar-fill" }).style.width = `${100 * stats.coverage}%`;
+      row.createSpan({ text: formatPercent(stats.coverage), cls: "rmv-bar-count" });
+      row.setAttr("aria-label", "Share of past exam questions your finished notes cover");
+    }
 
     for (const rank of RANKS) {
       const s = stats.byRank[rank];
@@ -937,18 +992,23 @@ class RandomMatrixView extends ItemView {
 
     const r1Left = plan.remaining[1];
     if (plan.daysLeft !== null) {
-      const need = r1Left / plan.daysLeft;
       const line = section.createDiv({ cls: "rmv-pace" });
       line.createSpan({ text: `${plan.daysLeft} days to exam` });
-      if (r1Left > 0) {
+      const all = [...plugin.conditions.values()];
+      const need = plan.byYield
+        ? paceForCoverage(all, COVERAGE_TARGET, plan.daysLeft)
+        : r1Left / plan.daysLeft;
+      if (need !== null && need > 0) {
         line.createSpan({
-          text: `${need.toFixed(1)}/day finishes rank 1`,
+          text: plan.byYield
+            ? `${need.toFixed(1)}/day reaches ${formatPercent(COVERAGE_TARGET)}`
+            : `${need.toFixed(1)}/day finishes rank 1`,
           cls: need > plugin.settings.dailyTarget ? "rmv-warn" : "",
         });
       }
     } else {
       const link = section.createDiv({ cls: "rmv-hint rmv-link" });
-      link.setText("Set an exam date to plan the rank mix →");
+      link.setText("Set an exam date to get a plan →");
       link.onclick = () => plugin.openSettings();
     }
     section.createDiv({ text: plan.summary, cls: "rmv-hint" });
@@ -1042,8 +1102,19 @@ class RandomMatrixSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Prioritise by exam yield")
+      .setDesc(
+        `Uses each note's "${settings.examYieldField}" (past-exam questions per 100) plus a small boost for matrix rank. Off, or for notes without it, matrix rank alone decides.`
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(settings.useExamYield)
+          .onChange((value) => this.saveSetting(() => (settings.useExamYield = value)))
+      );
+
+    new Setting(containerEl)
       .setName("Rank 2 weight")
-      .setDesc("How likely a rank 2 note is relative to a rank 1 note, when there's room for both.")
+      .setDesc("Without exam yield: how likely a rank 2 note is relative to a rank 1 note.")
       .addSlider((slider) =>
         slider
           .setLimits(0, 1, 0.05)
@@ -1074,7 +1145,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Frontmatter").setHeading();
 
-    const field = (name: string, key: "rankField" | "statusField" | "topicField" | "subtopicField" | "finishedValue" | "inProgressValue") =>
+    const field = (name: string, key: "rankField" | "statusField" | "topicField" | "subtopicField" | "finishedValue" | "inProgressValue" | "examYieldField") =>
       new Setting(containerEl).setName(name).addText((text) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS[key])
@@ -1089,6 +1160,7 @@ class RandomMatrixSettingTab extends PluginSettingTab {
     field("Subtopic field", "subtopicField");
     field("Finished status value", "finishedValue");
     field("In progress status value", "inProgressValue");
+    field("Exam yield field", "examYieldField");
   }
 }
 
@@ -1141,8 +1213,31 @@ function sameCondition(a: Condition | null, b: Condition | null): boolean {
     a.status === b.status &&
     a.area === b.area &&
     a.topic === b.topic &&
-    a.subtopic === b.subtopic
+    a.subtopic === b.subtopic &&
+    a.examYield === b.examYield &&
+    a.examTier === b.examTier &&
+    a.examSittings === b.examSittings
   );
+}
+
+function asNumber(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? parseFloat(value) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatPercent(share: number): string {
+  return `${Math.round(100 * share)}%`;
+}
+
+function describeExam(c: Condition): string {
+  const parts = [`Exam tier ${c.examTier}`];
+  if (c.examYield !== null) {
+    parts.push(`${c.examYield.toFixed(2)} questions per 100`);
+  }
+  if (c.examSittings !== null) {
+    parts.push(`main topic in ${c.examSittings} of 12 past papers`);
+  }
+  return parts.join(" · ");
 }
 
 function clampInt(value: number, min: number, max: number): number {

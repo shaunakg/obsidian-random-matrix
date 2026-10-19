@@ -10,6 +10,12 @@ export interface Condition {
   title: string;
   rank: Rank;
   status: Status;
+  /** Expected questions per 100 on past exams (exam_yield), if known. */
+  examYield: number | null;
+  /** Exam tier 1-4 (exam_rank), if known. */
+  examTier: number | null;
+  /** Past papers it was a main topic in (exam_sittings), if known. */
+  examSittings: number | null;
   /** First folder under the matrix folder, e.g. "GP" or "Psychiatry". */
   area: string;
   topic: string;
@@ -33,14 +39,20 @@ export interface PlanSettings {
   dailyTarget: number;
   rank2Weight: number;
   rank3Weight: number;
+  /** Rank by past-exam yield (when notes have it) instead of matrix rank alone. */
+  useExamYield: boolean;
 }
 
-export interface RankPlan {
-  /** Probability of each rank being drawn (before per-note factors). */
-  shares: Record<Rank, number>;
+export interface Plan {
+  /** Draw weight before per-note factors; 0 means outside the plan. */
+  priorityOf: (c: Condition) => number;
   remaining: Record<Rank, number>;
   daysLeft: number | null;
   capacity: number | null;
+  /** Unfinished notes the plan covers; null when everything is in play. */
+  planned: number | null;
+  /** Whether priorities come from exam yield. */
+  byYield: boolean;
   summary: string;
 }
 
@@ -60,6 +72,7 @@ const RECENT_TOPIC_PENALTY = 0.6;
 const RECENT_SUBTOPIC_PENALTY = 0.7;
 const SET_AREA_PENALTY = 0.5;
 const SET_TOPIC_PENALTY = 0.15;
+const MIN_SCOPED_PLAN = 5;
 
 export function daysUntil(examDate: string, now: number): number | null {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(examDate.trim());
@@ -89,79 +102,171 @@ export function countRemaining(conditions: Iterable<Condition>): Record<Rank, nu
 }
 
 /**
- * Decide how often each rank should come up. With an exam date, capacity
- * (days left x daily target) is spent on rank 1 first, then rank 2, then
- * rank 3; a rank only gets airtime if there is capacity left for it.
+ * Matrix rank as a prior on top of exam yield, in the same units (questions per
+ * 100). Keeps an unexamined rank 1 ahead of an unexamined rank 3, and roughly
+ * matches the median yield of each rank, so neither signal swamps the other.
  */
-export function planRanks(
-  remaining: Record<Rank, number>,
-  settings: PlanSettings,
-  now: number
-): RankPlan {
+const MATRIX_PRIOR: Record<Rank, number> = { 1: 0.1, 2: 0.03, 3: 0.01 };
+
+export function hasExamYield(conditions: Iterable<Condition>): boolean {
+  for (const c of conditions) {
+    if (c.examYield !== null) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** How much a note is worth studying, ignoring timing and variety. */
+export function basePriority(c: Condition, settings: PlanSettings, byYield: boolean): number {
+  if (byYield) {
+    return (c.examYield ?? 0) + MATRIX_PRIOR[c.rank];
+  }
   const weights: Record<Rank, number> = {
     1: 1,
     2: Math.max(0, settings.rank2Weight),
     3: Math.max(0, settings.rank3Weight),
   };
+  return weights[c.rank];
+}
+
+/**
+ * Decide what's worth drawing. With an exam date, capacity (days left x daily
+ * target) goes to the highest-priority unfinished notes; everything below the
+ * cut-off is left out. Notes tied at the cut-off share the remaining slots.
+ */
+export function makePlan(
+  conditions: Condition[],
+  settings: PlanSettings,
+  now: number
+): Plan {
+  const byYield = settings.useExamYield && hasExamYield(conditions);
+  const open = conditions.filter((c) => c.status !== "finished");
+  const remaining = countRemaining(open);
   const daysLeft = daysUntil(settings.examDate, now);
   const capacity = daysLeft !== null ? daysLeft * Math.max(0.1, settings.dailyTarget) : null;
+  const prio = (c: Condition) => basePriority(c, settings, byYield);
 
-  let budget: Record<Rank, number> = { ...remaining };
-  if (capacity !== null) {
-    let left = capacity;
-    for (const rank of RANKS) {
-      budget[rank] = Math.min(remaining[rank], left);
-      left = Math.max(0, left - budget[rank]);
-    }
+  let cutoff = -Infinity;
+  let tieScale = 1;
+  let planned: number | null = null;
+  if (capacity !== null && capacity < open.length) {
+    const sorted = open.map(prio).sort((x, y) => y - x);
+    const slots = Math.max(1, Math.floor(capacity));
+    cutoff = sorted[slots - 1];
+    const above = sorted.filter((p) => p > cutoff).length;
+    const tied = sorted.filter((p) => p === cutoff).length;
+    tieScale = (slots - above) / tied;
+    planned = slots;
   }
 
-  const raw: Record<Rank, number> = { 1: 0, 2: 0, 3: 0 };
-  for (const rank of RANKS) {
-    raw[rank] = budget[rank] * weights[rank];
-  }
-  let total = raw[1] + raw[2] + raw[3];
-  if (total <= 0) {
-    // Nothing fits the plan (or weights are zero): fall back to whatever is left.
-    budget = { ...remaining };
-    for (const rank of RANKS) {
-      raw[rank] = remaining[rank] * Math.max(weights[rank], 0.01);
+  const priorityOf = (c: Condition) => {
+    const p = prio(c);
+    if (p > cutoff) {
+      return p;
     }
-    total = raw[1] + raw[2] + raw[3];
-  }
-  const shares: Record<Rank, number> = { 1: 0, 2: 0, 3: 0 };
-  if (total > 0) {
-    for (const rank of RANKS) {
-      shares[rank] = raw[rank] / total;
-    }
-  }
+    return p === cutoff ? p * tieScale : 0;
+  };
 
   return {
-    shares,
+    priorityOf,
     remaining,
     daysLeft,
     capacity,
-    summary: describePlan(shares, remaining, daysLeft, capacity, settings.dailyTarget),
+    planned,
+    byYield,
+    summary: describePlan(conditions, open, priorityOf, byYield, daysLeft, planned, settings),
   };
 }
 
 function describePlan(
-  shares: Record<Rank, number>,
-  remaining: Record<Rank, number>,
+  all: Condition[],
+  open: Condition[],
+  priorityOf: (c: Condition) => number,
+  byYield: boolean,
   daysLeft: number | null,
-  capacity: number | null,
-  dailyTarget: number
+  planned: number | null,
+  settings: PlanSettings
 ): string {
-  const mix = RANKS.filter((r) => shares[r] >= 0.005)
-    .map((r) => `R${r} ${Math.round(shares[r] * 100)}%`)
+  const pace = `${settings.dailyTarget}/day`;
+  if (byYield) {
+    if (planned === null) {
+      return daysLeft === null
+        ? "Weighted by past-exam yield, then matrix rank."
+        : `Everything left fits in ${daysLeft}d at ${pace}; highest yield comes up most.`;
+    }
+    const total = sumYield(all);
+    const done = sumYield(all.filter((c) => c.status === "finished"));
+    const plan = sumYield(open.filter((c) => priorityOf(c) > 0));
+    const reach = total > 0 ? Math.round((100 * (done + plan)) / total) : 0;
+    return `Plan: the ${planned} highest-yield notes (${daysLeft}d at ${pace}). Finishing them covers ~${reach}% of past exam questions.`;
+  }
+  const shares: Record<Rank, number> = { 1: 0, 2: 0, 3: 0 };
+  let sum = 0;
+  for (const c of open) {
+    const w = priorityOf(c);
+    shares[c.rank] += w;
+    sum += w;
+  }
+  const mix = RANKS.filter((r) => sum > 0 && shares[r] / sum >= 0.005)
+    .map((r) => `R${r} ${Math.round((100 * shares[r]) / sum)}%`)
     .join(" · ");
-  if (daysLeft === null || capacity === null) {
+  if (daysLeft === null) {
     return `Mix: ${mix}`;
   }
-  const cap = Math.round(capacity);
-  if (remaining[1] >= capacity) {
-    return `Rank 1 only: ${remaining[1]} left, ~${cap} doable in ${daysLeft}d at ${dailyTarget}/day.`;
+  const remaining1 = open.filter((c) => c.rank === 1).length;
+  if (planned !== null && remaining1 >= planned) {
+    return `Rank 1 only: ${remaining1} left, ~${planned} doable in ${daysLeft}d at ${pace}.`;
   }
-  return `Mix: ${mix} (~${cap} doable in ${daysLeft}d at ${dailyTarget}/day).`;
+  return `Mix: ${mix} (${daysLeft}d at ${pace}).`;
+}
+
+export function sumYield(conditions: Iterable<Condition>): number {
+  let total = 0;
+  for (const c of conditions) {
+    total += c.examYield ?? 0;
+  }
+  return total;
+}
+
+/**
+ * Share of past exam questions covered by finished notes: the headline
+ * progress number when yield data exists.
+ */
+export function coverage(conditions: Condition[]): number | null {
+  const total = sumYield(conditions);
+  if (total <= 0) {
+    return null;
+  }
+  return sumYield(conditions.filter((c) => c.status === "finished")) / total;
+}
+
+/**
+ * Notes per day needed to reach a coverage target by the exam, taking the
+ * highest-yield unfinished notes first.
+ */
+export function paceForCoverage(
+  conditions: Condition[],
+  target: number,
+  daysLeft: number
+): number | null {
+  const total = sumYield(conditions);
+  if (total <= 0 || daysLeft <= 0) {
+    return null;
+  }
+  let covered = sumYield(conditions.filter((c) => c.status === "finished"));
+  const open = conditions
+    .filter((c) => c.status !== "finished")
+    .sort((a, b) => (b.examYield ?? 0) - (a.examYield ?? 0));
+  let needed = 0;
+  for (const c of open) {
+    if (covered / total >= target) {
+      break;
+    }
+    covered += c.examYield ?? 0;
+    needed += 1;
+  }
+  return needed / daysLeft;
 }
 
 function decay(elapsedMs: number, floor: number, halfLifeDays: number): number {
@@ -213,9 +318,7 @@ function subtopicKey(c: Condition): string | null {
 }
 
 export interface WeightContext {
-  plan: RankPlan;
-  /** Remaining (unfinished) count per rank within the current focus. */
-  scopeRemaining: Record<Rank, number>;
+  plan: Plan;
   state: PickState;
   recent: { topics: Set<string>; subtopics: Set<string> };
   now: number;
@@ -223,11 +326,10 @@ export interface WeightContext {
 
 /** Unnormalised probability of drawing this condition. */
 export function weightOf(c: Condition, ctx: WeightContext): number {
-  const scopeCount = ctx.scopeRemaining[c.rank];
-  if (scopeCount <= 0) {
+  let w = ctx.plan.priorityOf(c);
+  if (w <= 0) {
     return 0;
   }
-  let w = ctx.plan.shares[c.rank] / scopeCount;
 
   if (c.status === "in-progress") {
     w *= IN_PROGRESS_WEIGHT;
@@ -254,20 +356,18 @@ export function weightOf(c: Condition, ctx: WeightContext): number {
 }
 
 /**
- * If the plan gives zero weight to everything in scope (e.g. "rank 1 only"
- * but the focused rotation has no rank 1s left), re-plan within the scope
- * so the user still gets something.
+ * If the plan leaves (almost) nothing in scope, e.g. the focused rotation has
+ * few notes among the top picks, fall back to plain priorities within the
+ * scope so there is still a real choice.
  */
-export function effectivePlan(
-  plan: RankPlan,
-  scopeRemaining: Record<Rank, number>,
-  settings: PlanSettings
-): RankPlan {
-  const covered = RANKS.some((r) => plan.shares[r] > 0 && scopeRemaining[r] > 0);
-  if (covered) {
-    return plan;
-  }
-  return planRanks(scopeRemaining, { ...settings, examDate: "" }, 0);
+export function scopedPlan(
+  plan: Plan,
+  scope: Condition[],
+  settings: PlanSettings,
+  now: number
+): Plan {
+  const inPlan = scope.filter((c) => c.status !== "finished" && plan.priorityOf(c) > 0).length;
+  return inPlan >= MIN_SCOPED_PLAN ? plan : makePlan(scope, { ...settings, examDate: "" }, now);
 }
 
 /**
@@ -279,14 +379,18 @@ export function drawChoices(
   weight: (c: Condition) => number,
   count: number,
   rng: Rng,
-  exclude: Set<string> = new Set()
+  exclude: Set<string> = new Set(),
+  fallback?: (c: Condition) => number
 ): Condition[] {
   const pool = candidates.filter((c) => !exclude.has(c.path));
-  const base = pool.map((c) => weight(c));
+  const primary = pool.map((c) => weight(c));
+  const secondary = fallback ? pool.map((c) => fallback(c)) : null;
   const chosen: Condition[] = [];
 
-  while (chosen.length < count) {
-    const adjusted = pool.map((c, i) => {
+  // Fill from the primary weights; once they run dry (e.g. the plan's few
+  // remaining notes are all locked out), top up from the fallback weights.
+  const adjust = (base: number[]) =>
+    pool.map((c, i) => {
       if (chosen.includes(c)) {
         return 0;
       }
@@ -302,7 +406,11 @@ export function drawChoices(
       }
       return w;
     });
-    const index = weightedIndex(adjusted, rng);
+  while (chosen.length < count) {
+    let index = weightedIndex(adjust(primary), rng);
+    if (index < 0 && secondary) {
+      index = weightedIndex(adjust(secondary), rng);
+    }
     if (index < 0) {
       break;
     }
