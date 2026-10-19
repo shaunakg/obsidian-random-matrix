@@ -12,5 +12,5 @@
     "esModuleInterop": true,
     "types": ["obsidian"]
   },
-  "include": ["main.ts"]
+  "include": ["main.ts", "src/**/*.ts"]
 }

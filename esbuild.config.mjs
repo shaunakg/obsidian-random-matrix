@@ -11,7 +11,7 @@ const context = await esbuild.context({
   platform: "browser",
   external: ["obsidian"],
   outfile: "main.js",
-  sourcemap: "inline",
+  sourcemap: isWatch ? "inline" : false,
   treeShaking: true,
   logLevel: "info",
 });

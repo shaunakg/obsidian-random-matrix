@@ -1,9 +1,9 @@
 {
   "id": "obsidian-random-matrix",
   "name": "Random Matrix",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "minAppVersion": "1.4.0",
-  "description": "Smart random picker for matrix notes based on rank and status.",
+  "description": "Takes the decision out of what to study next: offers a few weighted picks from your matrix notes, paced to your exam date.",
   "author": "shaunakg",
   "isDesktopOnly": false
 }

@@ -6,726 +6,719 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  TAbstractFile,
   TFile,
   TFolder,
+  WorkspaceLeaf,
+  debounce,
   normalizePath,
 } from "obsidian";
+import {
+  Condition,
+  DAY_MS,
+  PassRecord,
+  PlanSettings,
+  RANKS,
+  Rank,
+  RankPlan,
+  Status,
+  countRemaining,
+  drawChoices,
+  effectivePlan,
+  isAvailable,
+  planRanks,
+  recentTopics,
+  startOfDay,
+  weightOf,
+  weightedIndex,
+} from "./src/engine";
 
 const VIEW_TYPE = "random-matrix-view";
-const FINISHED_STATUS = "finished";
+const FINISHED_STATUSES = ["finished", "done", "complete", "completed", "mastered"];
+const IN_PROGRESS_STATUSES = ["in-progress", "doing", "started"];
+const PASSED_RETENTION_MS = 30 * DAY_MS;
 
 interface RandomMatrixSettings {
-  targetFolder: string;
-  includeSubfolders: boolean;
-  excludePathFragments: string[];
+  matrixFolder: string;
+  examDate: string;
+  dailyTarget: number;
+  choiceCount: number;
+  rank2Weight: number;
+  rank3Weight: number;
+  snoozeDays: number;
 
   rankField: string;
   statusField: string;
   topicField: string;
   subtopicField: string;
-
-  completedStatuses: string[];
-  notStartedStatuses: string[];
-  inProgressStatuses: string[];
-
-  markCompletedValue: string;
-  markInProgressValue: string;
-  markNotStartedValue: string;
-
-  treatMissingStatusAsNotStarted: boolean;
-  includeUnranked: boolean;
-  unrankedRank: number;
-
-  notStartedWeight: number;
-  inProgressWeight: number;
-  unknownStatusWeight: number;
-
-  rank2ScatterBase: number;
-  rank2ScatterBoost: number;
-  rank2ScatterMax: number;
-  rank3ScatterBase: number;
-  rank3ScatterBoost: number;
-  rank3ScatterMax: number;
-
-  excludeRecentCount: number;
-  recentPenalty: number;
-  historyLimit: number;
-
-  stalenessDays: number;
-  maxStalenessBoost: number;
-
-  diversityWindow: number;
-  sameTopicPenalty: number;
-  sameSubtopicPenalty: number;
-
-  snoozeDays: number;
-
-  autoOpenOnPick: boolean;
-  openInNewLeaf: boolean;
-  autoMarkInProgressOnOpen: boolean;
-  revealInFileExplorer: boolean;
-
-  writeLastReviewed: boolean;
-  lastReviewedField: string;
+  finishedValue: string;
+  inProgressValue: string;
 }
 
-interface RandomMatrixData {
-  history: SelectionHistoryItem[];
+interface RandomMatrixState {
+  /** The note being studied right now. */
+  current: string | null;
+  /** Notes on offer when nothing is current. */
+  choices: string[];
+  /** Areas (top-level folders) to draw from; empty means all. */
+  focus: string[];
+  opened: Record<string, number>;
+  passed: Record<string, PassRecord>;
   snoozedUntil: Record<string, number>;
-  lastSeen: Record<string, number>;
+  completedAt: Record<string, number>;
 }
 
-interface SelectionHistoryItem {
-  path: string;
-  ts: number;
-  title: string;
-  rank: number | null;
-  topic: string;
-  subtopic: string;
+interface StoredData {
+  version: 2;
+  settings: RandomMatrixSettings;
+  state: RandomMatrixState;
 }
 
-interface NoteMeta {
-  file: TFile;
-  path: string;
-  title: string;
-  rank: number | null;
-  status: string;
-  statusGroup: "not-started" | "in-progress" | "unknown";
-  topic: string;
-  subtopic: string;
-  isCompleted: boolean;
+/** Shape written by 0.1.x, read once for migration. */
+interface LegacyData {
+  settings?: {
+    targetFolder?: string;
+    rankField?: string;
+    statusField?: string;
+    topicField?: string;
+    subtopicField?: string;
+    markCompletedValue?: string;
+    markInProgressValue?: string;
+    snoozeDays?: number;
+  };
+  data?: {
+    lastSeen?: Record<string, number>;
+    snoozedUntil?: Record<string, number>;
+  };
 }
 
-interface RankCounts {
+interface RankStats {
   total: number;
-  eligible: number;
-  completed: number;
+  done: number;
 }
 
 interface MatrixStats {
-  total: number;
-  eligible: number;
-  completed: number;
-  byRank: Record<number, RankCounts>;
-  byStatus: Record<string, number>;
+  byRank: Record<Rank, RankStats>;
+  byArea: Map<string, Record<Rank, RankStats>>;
+  today: number;
+  last7: number;
 }
 
-interface ScanResult {
-  notes: NoteMeta[];
-  eligible: NoteMeta[];
-  rankBuckets: Record<number, NoteMeta[]>;
-  stats: MatrixStats;
-}
-
-interface PickResult {
-  note: NoteMeta;
-  stats: MatrixStats;
-  reason: string;
+interface AppWithSettings extends App {
+  setting?: { open(): void; openTabById(id: string): void };
 }
 
 const DEFAULT_SETTINGS: RandomMatrixSettings = {
-  targetFolder: "",
-  includeSubfolders: true,
-  excludePathFragments: [],
+  matrixFolder: "",
+  examDate: "",
+  dailyTarget: 3,
+  choiceCount: 3,
+  rank2Weight: 0.3,
+  rank3Weight: 0.1,
+  snoozeDays: 2,
 
   rankField: "rank",
   statusField: "status",
   topicField: "topic",
   subtopicField: "subtopic",
-
-  completedStatuses: [FINISHED_STATUS, "done", "complete", "mastered"],
-  notStartedStatuses: ["not-started", "todo", "new"],
-  inProgressStatuses: ["in-progress", "doing", "started"],
-
-  markCompletedValue: FINISHED_STATUS,
-  markInProgressValue: "in-progress",
-  markNotStartedValue: "not-started",
-
-  treatMissingStatusAsNotStarted: true,
-  includeUnranked: false,
-  unrankedRank: 3,
-
-  notStartedWeight: 1,
-  inProgressWeight: 0.7,
-  unknownStatusWeight: 0.85,
-
-  rank2ScatterBase: 0.15,
-  rank2ScatterBoost: 0.35,
-  rank2ScatterMax: 0.6,
-  rank3ScatterBase: 0.03,
-  rank3ScatterBoost: 0.1,
-  rank3ScatterMax: 0.2,
-
-  excludeRecentCount: 5,
-  recentPenalty: 0.35,
-  historyLimit: 200,
-
-  stalenessDays: 14,
-  maxStalenessBoost: 1,
-
-  diversityWindow: 3,
-  sameTopicPenalty: 0.7,
-  sameSubtopicPenalty: 0.8,
-
-  snoozeDays: 1,
-
-  autoOpenOnPick: true,
-  openInNewLeaf: false,
-  autoMarkInProgressOnOpen: false,
-  revealInFileExplorer: false,
-
-  writeLastReviewed: false,
-  lastReviewedField: "last-reviewed",
+  finishedValue: "finished",
+  inProgressValue: "in-progress",
 };
 
-const DEFAULT_DATA: RandomMatrixData = {
-  history: [],
-  snoozedUntil: {},
-  lastSeen: {},
-};
+function defaultState(): RandomMatrixState {
+  return {
+    current: null,
+    choices: [],
+    focus: [],
+    opened: {},
+    passed: {},
+    snoozedUntil: {},
+    completedAt: {},
+  };
+}
 
 export default class RandomMatrixPlugin extends Plugin {
-  settings: RandomMatrixSettings = DEFAULT_SETTINGS;
-  data: RandomMatrixData = DEFAULT_DATA;
-  lastPick: PickResult | null = null;
+  settings: RandomMatrixSettings = { ...DEFAULT_SETTINGS };
+  state: RandomMatrixState = defaultState();
+  conditions = new Map<string, Condition>();
+  indexed = false;
+
+  private requestSave = debounce(() => void this.persist(), 500, true);
+  private requestRender = debounce(() => this.renderViews(), 150, true);
 
   async onload() {
     await this.loadPluginData();
 
     this.registerView(VIEW_TYPE, (leaf) => new RandomMatrixView(leaf, this));
+    this.addRibbonIcon("dice", "Random Matrix", () => void this.activateView());
+    this.addSettingTab(new RandomMatrixSettingTab(this.app, this));
+    this.registerCommands();
 
-    this.addRibbonIcon("dice", "Random Matrix", () => {
-      this.activateView();
+    this.app.workspace.onLayoutReady(() => this.rebuildIndex());
+    // On a fresh device the cache may still be filling at layout-ready; rebuild once it settles.
+    const onResolved = this.app.metadataCache.on("resolved", () => {
+      this.app.metadataCache.offref(onResolved);
+      this.rebuildIndex();
     });
+    this.registerEvent(onResolved);
+    this.registerEvent(
+      this.app.metadataCache.on("changed", (file) => this.onFileChanged(file))
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => this.onFileRenamed(file, oldPath))
+    );
+    this.registerEvent(this.app.vault.on("delete", (file) => this.onFileDeleted(file)));
+  }
 
+  private registerCommands() {
     this.addCommand({
       id: "random-matrix-pick",
-      name: "Random Matrix: Pick next condition",
-      callback: async () => {
-        const result = await this.pickNext();
-        if (!result) {
-          return;
-        }
-        if (this.settings.autoOpenOnPick) {
-          await this.openNote(result.note);
-        }
-        this.refreshView();
-      },
-    });
-
-    this.addCommand({
-      id: "random-matrix-pick-no-open",
-      name: "Random Matrix: Pick next condition (no open)",
-      callback: async () => {
-        await this.pickNext();
-        this.refreshView();
-      },
+      name: "Pick for me and open",
+      callback: () => void this.pickForMe(),
     });
 
     this.addCommand({
       id: "random-matrix-open-panel",
-      name: "Random Matrix: Open panel",
-      callback: () => this.activateView(),
+      name: "Open panel",
+      callback: () => void this.activateView(),
     });
 
     this.addCommand({
       id: "random-matrix-mark-completed",
-      name: "Random Matrix: Mark current note completed",
+      name: "Mark this note finished",
       checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file) {
-          return false;
+        const file = this.activeCondition();
+        if (file && !checking) {
+          void this.markFinished(file);
         }
-        if (!checking) {
-          void this.updateStatus(file, this.settings.markCompletedValue);
+        return file !== null;
+      },
+    });
+
+    this.addCommand({
+      id: "random-matrix-finish-and-next",
+      name: "Mark this note finished and pick the next one",
+      checkCallback: (checking) => {
+        const file = this.activeCondition();
+        if (file && !checking) {
+          void this.markFinished(file).then(() => this.pickForMe());
         }
-        return true;
+        return file !== null;
       },
     });
 
     this.addCommand({
       id: "random-matrix-mark-in-progress",
-      name: "Random Matrix: Mark current note in progress",
+      name: "Mark this note in progress",
       checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file) {
-          return false;
+        const file = this.activeCondition();
+        if (file && !checking) {
+          void this.setStatus(file, this.settings.inProgressValue);
         }
-        if (!checking) {
-          void this.updateStatus(file, this.settings.markInProgressValue);
-        }
-        return true;
+        return file !== null;
       },
     });
 
     this.addCommand({
-      id: "random-matrix-mark-not-started",
-      name: "Random Matrix: Reset current note to not started",
+      id: "random-matrix-snooze",
+      name: "Snooze this note",
       checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file) {
-          return false;
+        const file = this.activeCondition();
+        if (file && !checking) {
+          this.snooze(file.path);
         }
-        if (!checking) {
-          void this.updateStatus(file, this.settings.markNotStartedValue);
-        }
-        return true;
+        return file !== null;
       },
     });
-
-    this.addCommand({
-      id: "random-matrix-set-target-from-active",
-      name: "Random Matrix: Set target folder from current note",
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file || !file.parent) {
-          return false;
-        }
-        if (!checking) {
-          this.settings.targetFolder = file.parent.path;
-          void this.savePluginData();
-          this.refreshView();
-          new Notice(`Random Matrix: target folder set to ${file.parent.path}`);
-        }
-        return true;
-      },
-    });
-
-    this.addSettingTab(new RandomMatrixSettingTab(this.app, this));
   }
 
   onunload() {
-    this.app.workspace.getLeavesOfType(VIEW_TYPE).forEach((leaf) => leaf.detach());
+    this.requestSave.run();
   }
 
+  // ---------------------------------------------------------------------------
+  // Persistence
+
+  async loadPluginData() {
+    const stored = (await this.loadData()) as Partial<StoredData> & LegacyData | null;
+    if (stored && stored.version === 2) {
+      this.settings = { ...DEFAULT_SETTINGS, ...stored.settings };
+      this.state = { ...defaultState(), ...stored.state };
+      return;
+    }
+    if (stored) {
+      this.migrateLegacy(stored);
+      await this.persist();
+    }
+  }
+
+  private migrateLegacy(legacy: LegacyData) {
+    const s = legacy.settings ?? {};
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      matrixFolder: s.targetFolder ? normalizePath(s.targetFolder) : "",
+      rankField: s.rankField || DEFAULT_SETTINGS.rankField,
+      statusField: s.statusField || DEFAULT_SETTINGS.statusField,
+      topicField: s.topicField || DEFAULT_SETTINGS.topicField,
+      subtopicField: s.subtopicField || DEFAULT_SETTINGS.subtopicField,
+      finishedValue: s.markCompletedValue || DEFAULT_SETTINGS.finishedValue,
+      inProgressValue: s.markInProgressValue || DEFAULT_SETTINGS.inProgressValue,
+      snoozeDays: s.snoozeDays ?? DEFAULT_SETTINGS.snoozeDays,
+    };
+    this.state = {
+      ...defaultState(),
+      opened: { ...(legacy.data?.lastSeen ?? {}) },
+      snoozedUntil: { ...(legacy.data?.snoozedUntil ?? {}) },
+    };
+  }
+
+  async persist() {
+    this.pruneState(Date.now());
+    const data: StoredData = { version: 2, settings: this.settings, state: this.state };
+    await this.saveData(data);
+  }
+
+  /** Save soon and redraw the panel. */
+  changed() {
+    this.requestSave();
+    this.requestRender();
+  }
+
+  private pruneState(now: number) {
+    for (const [path, until] of Object.entries(this.state.snoozedUntil)) {
+      if (until <= now) {
+        delete this.state.snoozedUntil[path];
+      }
+    }
+    for (const [path, record] of Object.entries(this.state.passed)) {
+      if (now - record.ts > PASSED_RETENTION_MS) {
+        delete this.state.passed[path];
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Index of matrix notes, kept in sync with the metadata cache
+
+  matrixFolder(): string {
+    const folder = this.settings.matrixFolder.trim();
+    return folder ? normalizePath(folder) : "";
+  }
+
+  private inMatrixFolder(path: string): boolean {
+    const folder = this.matrixFolder();
+    return folder !== "" && path.startsWith(`${folder}/`);
+  }
+
+  rebuildIndex() {
+    this.conditions.clear();
+    if (this.matrixFolder()) {
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        const condition = this.parseFile(file);
+        if (condition) {
+          this.conditions.set(file.path, condition);
+        }
+      }
+    }
+    this.reconcileCompletions();
+    this.indexed = true;
+    this.changed();
+  }
+
+  /**
+   * Make completedAt agree with note statuses. Notes finished while the plugin
+   * wasn't watching get their file modification time as a best guess.
+   */
+  private reconcileCompletions() {
+    for (const [path, condition] of this.conditions) {
+      const logged = path in this.state.completedAt;
+      if (condition.status === "finished" && !logged) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        this.state.completedAt[path] = file instanceof TFile ? file.stat.mtime : Date.now();
+      } else if (condition.status !== "finished" && logged) {
+        delete this.state.completedAt[path];
+      }
+    }
+  }
+
+  private parseFile(file: TFile): Condition | null {
+    if (file.extension !== "md" || !this.inMatrixFolder(file.path)) {
+      return null;
+    }
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    if (!fm) {
+      return null;
+    }
+    const rank = parseRank(fm[this.settings.rankField]);
+    if (rank === null) {
+      return null;
+    }
+    const relative = file.path.slice(this.matrixFolder().length + 1).split("/");
+    return {
+      path: file.path,
+      title: asString(fm.title) || file.basename,
+      rank,
+      status: this.classifyStatus(fm[this.settings.statusField], fm),
+      area: relative.length > 1 ? relative[0] : "",
+      topic: asString(fm[this.settings.topicField]),
+      subtopic: asString(fm[this.settings.subtopicField]),
+    };
+  }
+
+  private classifyStatus(raw: unknown, fm: Record<string, unknown>): Status {
+    const status = asString(raw).toLowerCase();
+    if (
+      status === this.settings.finishedValue.toLowerCase() ||
+      FINISHED_STATUSES.includes(status) ||
+      fm.completed === true ||
+      fm.done === true
+    ) {
+      return "finished";
+    }
+    if (
+      status === this.settings.inProgressValue.toLowerCase() ||
+      IN_PROGRESS_STATUSES.includes(status)
+    ) {
+      return "in-progress";
+    }
+    return "not-started";
+  }
+
+  private onFileChanged(file: TFile) {
+    if (!this.indexed || !this.inMatrixFolder(file.path)) {
+      return;
+    }
+    this.applyCondition(file.path, this.parseFile(file));
+  }
+
+  /** Swap in a fresh parse of a note, logging completions as they happen. */
+  private applyCondition(path: string, next: Condition | null) {
+    const prev = this.conditions.get(path) ?? null;
+    if (next) {
+      this.conditions.set(path, next);
+    } else {
+      this.conditions.delete(path);
+    }
+
+    const wasFinished = prev?.status === "finished";
+    const isFinished = next?.status === "finished";
+    if (!wasFinished && isFinished) {
+      this.state.completedAt[path] = Date.now();
+    } else if (wasFinished && !isFinished) {
+      delete this.state.completedAt[path];
+    }
+
+    if (!sameCondition(prev, next)) {
+      this.changed();
+    }
+  }
+
+  private onFileRenamed(file: TAbstractFile, oldPath: string) {
+    if (!(file instanceof TFile)) {
+      // Folder renames fire per-file as well; a renamed matrix folder needs a settings change.
+      return;
+    }
+    const s = this.state;
+    for (const map of [s.opened, s.passed, s.snoozedUntil, s.completedAt] as Record<string, unknown>[]) {
+      if (oldPath in map) {
+        map[file.path] = map[oldPath];
+        delete map[oldPath];
+      }
+    }
+    if (s.current === oldPath) {
+      s.current = file.path;
+    }
+    s.choices = s.choices.map((p) => (p === oldPath ? file.path : p));
+    this.conditions.delete(oldPath);
+    const next = this.parseFile(file);
+    if (next) {
+      this.conditions.set(file.path, next);
+    }
+    this.changed();
+  }
+
+  private onFileDeleted(file: TAbstractFile) {
+    if (this.conditions.has(file.path)) {
+      this.conditions.delete(file.path);
+      delete this.state.completedAt[file.path];
+      this.changed();
+    }
+  }
+
+  private activeCondition(): TFile | null {
+    const file = this.app.workspace.getActiveFile();
+    return file && this.conditions.has(file.path) ? file : null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Picking
+
+  areas(): string[] {
+    const set = new Set<string>();
+    for (const c of this.conditions.values()) {
+      if (c.area) {
+        set.add(c.area);
+      }
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }
+
+  inFocus(c: Condition): boolean {
+    return this.state.focus.length === 0 || this.state.focus.includes(c.area);
+  }
+
+  planSettings(): PlanSettings {
+    return {
+      examDate: this.settings.examDate,
+      dailyTarget: this.settings.dailyTarget,
+      rank2Weight: this.settings.rank2Weight,
+      rank3Weight: this.settings.rank3Weight,
+    };
+  }
+
+  plan(now = Date.now()): RankPlan {
+    return planRanks(countRemaining(this.conditions.values()), this.planSettings(), now);
+  }
+
+  /** Current note, cleared if it has since been finished, snoozed or removed. */
+  currentCondition(): Condition | null {
+    const path = this.state.current;
+    if (!path) {
+      return null;
+    }
+    const c = this.conditions.get(path);
+    const snoozed = (this.state.snoozedUntil[path] ?? 0) > Date.now();
+    if (!c || c.status === "finished" || snoozed) {
+      this.state.current = null;
+      this.changed();
+      return null;
+    }
+    return c;
+  }
+
+  /** Choices on offer, topped up to the configured count. */
+  choices(): Condition[] {
+    const now = Date.now();
+    const kept = this.state.choices
+      .map((p) => this.conditions.get(p))
+      .filter((c): c is Condition => {
+        if (!c || !this.inFocus(c) || c.status === "finished") {
+          return false;
+        }
+        return (this.state.snoozedUntil[c.path] ?? 0) <= now;
+      });
+    const wanted = clampInt(this.settings.choiceCount, 1, 5);
+    if (kept.length < wanted) {
+      const exclude = new Set(kept.map((c) => c.path));
+      kept.push(...this.draw(wanted - kept.length, now, exclude));
+    }
+    const paths = kept.map((c) => c.path);
+    if (paths.join("\n") !== this.state.choices.join("\n")) {
+      this.state.choices = paths;
+      this.requestSave();
+    }
+    return kept;
+  }
+
+  private draw(count: number, now: number, exclude: Set<string>): Condition[] {
+    const all = [...this.conditions.values()];
+    const scoped = all.filter((c) => this.inFocus(c));
+    const scopeRemaining = countRemaining(scoped);
+    const ctx = {
+      plan: effectivePlan(this.plan(now), scopeRemaining, this.planSettings()),
+      scopeRemaining,
+      state: this.state,
+      recent: recentTopics(this.state, (p) => this.conditions.get(p)),
+      now,
+    };
+    let candidates = scoped.filter((c) => isAvailable(c, this.state, now));
+    if (candidates.length === 0) {
+      // Everything is locked out by recent passes; let them back in rather than show nothing.
+      candidates = scoped.filter(
+        (c) => c.status !== "finished" && (this.state.snoozedUntil[c.path] ?? 0) <= now
+      );
+    }
+    return drawChoices(candidates, (c) => weightOf(c, ctx), count, Math.random, exclude);
+  }
+
+  /** Pass on everything shown and offer a fresh set. */
+  shuffle() {
+    const now = Date.now();
+    for (const path of this.state.choices) {
+      this.markPassed(path, now);
+    }
+    this.state.choices = [];
+    this.changed();
+  }
+
+  private markPassed(path: string, now: number) {
+    const prev = this.state.passed[path];
+    this.state.passed[path] = { ts: now, count: (prev?.count ?? 0) + 1 };
+  }
+
+  async choose(path: string) {
+    const now = Date.now();
+    for (const other of this.state.choices) {
+      if (other !== path) {
+        this.markPassed(other, now);
+      }
+    }
+    this.state.choices = [];
+    this.state.current = path;
+    this.state.opened[path] = now;
+    this.changed();
+    await this.openPath(path);
+  }
+
+  async pickForMe() {
+    const current = this.currentCondition();
+    if (current) {
+      await this.openPath(current.path);
+      return;
+    }
+    if (!this.indexed) {
+      new Notice("Random Matrix: still indexing, try again in a moment.");
+      return;
+    }
+    const options = this.choices();
+    const index = weightedIndex(options.map(() => 1), Math.random);
+    if (index < 0) {
+      new Notice(
+        this.matrixFolder()
+          ? "Random Matrix: nothing left to pick. Nice."
+          : "Random Matrix: set your matrix folder in settings first."
+      );
+      return;
+    }
+    await this.choose(options[index].path);
+  }
+
+  /** Stop studying the current note without finishing it. */
+  putBack() {
+    if (this.state.current) {
+      this.markPassed(this.state.current, Date.now());
+      this.state.current = null;
+      this.changed();
+    }
+  }
+
+  snooze(path: string) {
+    const days = Math.max(0.1, this.settings.snoozeDays);
+    this.state.snoozedUntil[path] = Date.now() + days * DAY_MS;
+    if (this.state.current === path) {
+      this.state.current = null;
+    }
+    this.state.choices = this.state.choices.filter((p) => p !== path);
+    this.changed();
+    new Notice(`Random Matrix: snoozed for ${formatDays(days)}.`);
+  }
+
+  async openPath(path: string) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      return;
+    }
+    const existing = this.app.workspace
+      .getLeavesOfType("markdown")
+      .find((leaf) => (leaf.view as { file?: TFile }).file?.path === path);
+    if (existing) {
+      this.app.workspace.setActiveLeaf(existing, { focus: true });
+      return;
+    }
+    await this.app.workspace.getLeaf(false).openFile(file, { active: true });
+  }
+
+  async setStatus(file: TFile, value: string) {
+    await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+      fm[this.settings.statusField] = value;
+    });
+    // Apply immediately rather than waiting for the metadata cache to catch up.
+    const prev = this.conditions.get(file.path);
+    if (prev) {
+      const status = this.classifyStatus(value, {});
+      this.applyCondition(file.path, { ...prev, status });
+    }
+  }
+
+  async markFinished(file: TFile) {
+    await this.setStatus(file, this.settings.finishedValue);
+    const stats = this.stats();
+    const title = this.conditions.get(file.path)?.title ?? file.basename;
+    new Notice(`Finished ${title}. ${stats.today} today.`);
+  }
+
+  stats(now = Date.now()): MatrixStats {
+    const empty = (): Record<Rank, RankStats> => ({
+      1: { total: 0, done: 0 },
+      2: { total: 0, done: 0 },
+      3: { total: 0, done: 0 },
+    });
+    const byRank = empty();
+    const byArea = new Map<string, Record<Rank, RankStats>>();
+    for (const c of this.conditions.values()) {
+      const area = byArea.get(c.area) ?? empty();
+      byArea.set(c.area, area);
+      for (const bucket of [byRank[c.rank], area[c.rank]]) {
+        bucket.total += 1;
+        if (c.status === "finished") {
+          bucket.done += 1;
+        }
+      }
+    }
+    const todayStart = startOfDay(now);
+    const weekStart = todayStart - 6 * DAY_MS;
+    let today = 0;
+    let last7 = 0;
+    for (const ts of Object.values(this.state.completedAt)) {
+      if (ts >= todayStart) {
+        today += 1;
+      }
+      if (ts >= weekStart) {
+        last7 += 1;
+      }
+    }
+    return { byRank, byArea, today, last7 };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Views
+
   async activateView() {
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-    if (leaves.length === 0) {
-      const leaf =
-        this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+    const { workspace } = this.app;
+    let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VIEW_TYPE)[0] ?? null;
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false);
       if (!leaf) {
         return;
       }
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
-    const activeLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-    if (activeLeaves.length > 0) {
-      this.app.workspace.revealLeaf(activeLeaves[0]);
-    }
+    workspace.revealLeaf(leaf);
   }
 
-  async loadPluginData() {
-    const stored = (await this.loadData()) as
-      | { settings?: Partial<RandomMatrixSettings>; data?: Partial<RandomMatrixData> }
-      | undefined;
-    this.settings = { ...DEFAULT_SETTINGS, ...(stored?.settings ?? {}) };
-    this.data = { ...DEFAULT_DATA, ...(stored?.data ?? {}) };
-    this.normalizeSettings();
-  }
-
-  async savePluginData() {
-    await this.saveData({
-      settings: this.settings,
-      data: this.data,
-    });
-  }
-
-  normalizeSettings() {
-    this.settings.completedStatuses = normalizeList(this.settings.completedStatuses);
-    if (!this.settings.completedStatuses.includes(FINISHED_STATUS)) {
-      this.settings.completedStatuses.unshift(FINISHED_STATUS);
-    }
-    this.settings.notStartedStatuses = normalizeList(this.settings.notStartedStatuses);
-    this.settings.inProgressStatuses = normalizeList(this.settings.inProgressStatuses);
-    const markCompletedValue = normalizeStatus(this.settings.markCompletedValue);
-    this.settings.markCompletedValue = markCompletedValue || FINISHED_STATUS;
-    this.settings.excludePathFragments = (this.settings.excludePathFragments || []).filter(
-      (value) => value.trim().length > 0
-    );
-  }
-
-  refreshView() {
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-    for (const leaf of leaves) {
-      const view = leaf.view;
-      if (view instanceof RandomMatrixView) {
-        void view.refresh();
+  private renderViews() {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      if (leaf.view instanceof RandomMatrixView) {
+        leaf.view.render();
       }
     }
   }
 
-  async pickNext(): Promise<PickResult | null> {
-    const scan = await this.scanNotes();
-    if (scan.eligible.length === 0) {
-      new Notice("Random Matrix: no eligible notes found.");
-      return null;
-    }
-
-    const targetRank = this.selectTargetRank(scan);
-    const candidates = scan.rankBuckets[targetRank] ?? scan.eligible;
-    if (candidates.length === 0) {
-      new Notice("Random Matrix: no candidates at target rank.");
-      return null;
-    }
-
-    const pick = this.weightedPick(candidates);
-    if (!pick) {
-      new Notice("Random Matrix: could not select a note.");
-      return null;
-    }
-
-    this.recordPick(pick);
-
-    const reason = `rank ${targetRank} bucket, ${pick.statusGroup}`;
-
-    this.lastPick = { note: pick, stats: scan.stats, reason };
-    return this.lastPick;
-  }
-
-  async openNote(note: NoteMeta) {
-    const leaf = this.settings.openInNewLeaf
-      ? this.app.workspace.getLeaf(true)
-      : this.app.workspace.getLeaf(false);
-    await leaf.openFile(note.file, { active: true });
-    if (this.settings.autoMarkInProgressOnOpen) {
-      const statusNormalized = normalizeStatus(note.status);
-      if (!this.isCompletedStatus(statusNormalized) && note.statusGroup !== "in-progress") {
-        await this.updateStatus(note.file, this.settings.markInProgressValue);
-      }
-    }
-    if (this.settings.writeLastReviewed) {
-      await this.touchLastReviewed(note.file);
-    }
-    if (this.settings.revealInFileExplorer) {
-      this.revealInFileExplorer(note.file);
-    }
-  }
-
-  async updateStatus(file: TFile, statusValue: string) {
-    const field = this.settings.statusField;
-    await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-      frontmatter[field] = statusValue;
-      if (this.settings.writeLastReviewed) {
-        frontmatter[this.settings.lastReviewedField] = new Date().toISOString();
-      }
-    });
-    new Notice(`Random Matrix: status set to ${statusValue}`);
-    this.refreshView();
-  }
-
-  async touchLastReviewed(file: TFile) {
-    await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-      frontmatter[this.settings.lastReviewedField] = new Date().toISOString();
-    });
-  }
-
-  async snoozeNote(note: NoteMeta, days: number) {
-    const until = Date.now() + days * 24 * 60 * 60 * 1000;
-    this.data.snoozedUntil[note.path] = until;
-    await this.savePluginData();
-    new Notice(`Random Matrix: snoozed for ${days} day(s).`);
-  }
-
-  revealInFileExplorer(file: TFile) {
-    const leaves = this.app.workspace.getLeavesOfType("file-explorer");
-    if (!leaves.length) {
-      return;
-    }
-    const view = leaves[0].view as any;
-    if (view?.revealInFolder) {
-      view.revealInFolder(file);
-    }
-  }
-
-  async scanNotes(): Promise<ScanResult> {
-    const stats: MatrixStats = {
-      total: 0,
-      eligible: 0,
-      completed: 0,
-      byRank: {
-        1: { total: 0, eligible: 0, completed: 0 },
-        2: { total: 0, eligible: 0, completed: 0 },
-        3: { total: 0, eligible: 0, completed: 0 },
-      },
-      byStatus: {},
-    };
-
-    const notes: NoteMeta[] = [];
-    const eligible: NoteMeta[] = [];
-    const rankBuckets: Record<number, NoteMeta[]> = { 1: [], 2: [], 3: [] };
-
-    const targetFolder = normalizeTargetFolder(this.settings.targetFolder);
-    if (!targetFolder) {
-      return { notes, eligible, rankBuckets, stats };
-    }
-
-    const recentBlocklist = new Set(
-      this.data.history.slice(0, Math.max(0, this.settings.excludeRecentCount)).map((h) => h.path)
-    );
-
-    const now = Date.now();
-    this.purgeExpiredSnoozes(now);
-
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      if (!this.isFileInTargetFolder(file, targetFolder)) {
-        continue;
-      }
-      if (this.isExcludedPath(file.path)) {
-        continue;
-      }
-
-      const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
-      const rank = this.parseRank(frontmatter[this.settings.rankField]);
-
-      if (rank === null && !this.settings.includeUnranked) {
-        continue;
-      }
-
-      const statusRaw = frontmatter[this.settings.statusField];
-      const status = normalizeStatus(statusRaw);
-      const statusGroup = this.getStatusGroup(status, statusRaw);
-      const isCompleted = this.isCompleted(status, frontmatter);
-
-      const topic = normalizeString(frontmatter[this.settings.topicField]);
-      const subtopic = normalizeString(frontmatter[this.settings.subtopicField]);
-      const title = normalizeString(frontmatter["title"]) || file.basename;
-
-      const note: NoteMeta = {
-        file,
-        path: file.path,
-        title,
-        rank: rank ?? this.settings.unrankedRank,
-        status,
-        statusGroup,
-        topic,
-        subtopic,
-        isCompleted,
-      };
-
-      notes.push(note);
-      stats.total += 1;
-
-      const rankBucket = note.rank ?? this.settings.unrankedRank;
-      if (!stats.byRank[rankBucket]) {
-        stats.byRank[rankBucket] = { total: 0, eligible: 0, completed: 0 };
-      }
-      stats.byRank[rankBucket].total += 1;
-
-      if (status) {
-        stats.byStatus[status] = (stats.byStatus[status] ?? 0) + 1;
-      }
-
-      if (isCompleted) {
-        stats.completed += 1;
-        stats.byRank[rankBucket].completed += 1;
-        continue;
-      }
-
-      if (this.data.snoozedUntil[file.path] && this.data.snoozedUntil[file.path] > now) {
-        continue;
-      }
-
-      if (recentBlocklist.has(file.path)) {
-        continue;
-      }
-
-      eligible.push(note);
-      stats.eligible += 1;
-      stats.byRank[rankBucket].eligible += 1;
-      rankBuckets[rankBucket].push(note);
-    }
-
-    return { notes, eligible, rankBuckets, stats };
-  }
-
-  selectTargetRank(scan: ScanResult): number {
-    const rank1Total = scan.stats.byRank[1]?.total ?? 0;
-    const rank1Remaining = scan.rankBuckets[1]?.length ?? 0;
-    const rank2Remaining = scan.rankBuckets[2]?.length ?? 0;
-    const rank3Remaining = scan.rankBuckets[3]?.length ?? 0;
-
-    if (rank1Remaining > 0) {
-      const completion = rank1Total > 0 ? 1 - rank1Remaining / rank1Total : 1;
-      const rank2Chance = clamp(
-        this.settings.rank2ScatterBase + this.settings.rank2ScatterBoost * completion,
-        0,
-        this.settings.rank2ScatterMax
-      );
-      const rank3Chance = clamp(
-        this.settings.rank3ScatterBase + this.settings.rank3ScatterBoost * completion,
-        0,
-        this.settings.rank3ScatterMax
-      );
-
-      const roll = Math.random();
-      if (rank2Remaining > 0 && roll < rank2Chance) {
-        return 2;
-      }
-      if (rank3Remaining > 0 && roll < rank2Chance + rank3Chance) {
-        return 3;
-      }
-      return 1;
-    }
-
-    if (rank2Remaining > 0) {
-      const completion = rank2Remaining > 0 ? 1 - rank2Remaining / (scan.stats.byRank[2]?.total ?? 1) : 1;
-      const rank3Chance = clamp(
-        this.settings.rank3ScatterBase + this.settings.rank3ScatterBoost * completion,
-        0,
-        this.settings.rank3ScatterMax
-      );
-      if (rank3Remaining > 0 && Math.random() < rank3Chance) {
-        return 3;
-      }
-      return 2;
-    }
-
-    return 3;
-  }
-
-  weightedPick(candidates: NoteMeta[]): NoteMeta | null {
-    if (candidates.length === 0) {
-      return null;
-    }
-
-    const weights = candidates.map((note) => this.scoreNote(note));
-    const total = weights.reduce((sum, value) => sum + value, 0);
-    if (total <= 0) {
-      return candidates[Math.floor(Math.random() * candidates.length)];
-    }
-
-    let roll = Math.random() * total;
-    for (let i = 0; i < candidates.length; i += 1) {
-      roll -= weights[i];
-      if (roll <= 0) {
-        return candidates[i];
-      }
-    }
-
-    return candidates[candidates.length - 1];
-  }
-
-  scoreNote(note: NoteMeta): number {
-    let weight = 1;
-
-    if (note.statusGroup === "not-started") {
-      weight *= this.settings.notStartedWeight;
-    } else if (note.statusGroup === "in-progress") {
-      weight *= this.settings.inProgressWeight;
-    } else {
-      weight *= this.settings.unknownStatusWeight;
-    }
-
-    const historyIndex = this.data.history.findIndex((item) => item.path === note.path);
-    if (historyIndex >= 0) {
-      weight *= Math.pow(this.settings.recentPenalty, historyIndex + 1);
-    }
-
-    const lastSeen = this.data.lastSeen[note.path] ?? 0;
-    if (this.settings.stalenessDays > 0) {
-      const daysSince = lastSeen > 0 ? (Date.now() - lastSeen) / (24 * 60 * 60 * 1000) : this.settings.stalenessDays * 2;
-      const boost = Math.min(this.settings.maxStalenessBoost, daysSince / this.settings.stalenessDays);
-      weight *= 1 + boost;
-    }
-
-    if (this.settings.diversityWindow > 0 && this.data.history.length > 0) {
-      const recent = this.data.history.slice(0, this.settings.diversityWindow);
-      if (note.topic && recent.some((item) => item.topic === note.topic)) {
-        weight *= this.settings.sameTopicPenalty;
-      }
-      if (note.subtopic && recent.some((item) => item.subtopic === note.subtopic)) {
-        weight *= this.settings.sameSubtopicPenalty;
-      }
-    }
-
-    return Math.max(0.0001, weight);
-  }
-
-  recordPick(note: NoteMeta) {
-    const now = Date.now();
-    this.data.history.unshift({
-      path: note.path,
-      ts: now,
-      title: note.title,
-      rank: note.rank,
-      topic: note.topic,
-      subtopic: note.subtopic,
-    });
-    if (this.data.history.length > this.settings.historyLimit) {
-      this.data.history.length = this.settings.historyLimit;
-    }
-    this.data.lastSeen[note.path] = now;
-    void this.savePluginData();
-  }
-
-  parseRank(value: unknown): number | null {
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return Math.max(1, Math.min(3, Math.round(value)));
-    }
-    if (typeof value === "string") {
-      const parsed = parseInt(value, 10);
-      if (!Number.isNaN(parsed)) {
-        return Math.max(1, Math.min(3, parsed));
-      }
-    }
-    return null;
-  }
-
-  getStatusGroup(status: string, raw: unknown): "not-started" | "in-progress" | "unknown" {
-    if (!status && raw === undefined && this.settings.treatMissingStatusAsNotStarted) {
-      return "not-started";
-    }
-    if (this.settings.notStartedStatuses.includes(status)) {
-      return "not-started";
-    }
-    if (this.settings.inProgressStatuses.includes(status)) {
-      return "in-progress";
-    }
-    return "unknown";
-  }
-
-  isCompleted(status: string, frontmatter: Record<string, unknown>): boolean {
-    if (this.isCompletedStatus(status)) {
-      return true;
-    }
-    return frontmatter.completed === true || frontmatter.done === true;
-  }
-
-  isCompletedStatus(status: string): boolean {
-    return this.settings.completedStatuses.includes(status);
-  }
-
-  isExcludedPath(path: string): boolean {
-    return this.settings.excludePathFragments.some((fragment) =>
-      fragment.length > 0 ? path.includes(fragment) : false
-    );
-  }
-
-  isFileInTargetFolder(file: TFile, targetFolder: string): boolean {
-    if (!targetFolder) {
-      return false;
-    }
-    const targetPrefix = targetFolder.endsWith("/") ? targetFolder : `${targetFolder}/`;
-    if (this.settings.includeSubfolders) {
-      return file.path.startsWith(targetPrefix) || file.parent?.path === targetFolder;
-    }
-    return file.parent?.path === targetFolder;
-  }
-
-  purgeExpiredSnoozes(now: number) {
-    for (const [path, until] of Object.entries(this.data.snoozedUntil)) {
-      if (until <= now) {
-        delete this.data.snoozedUntil[path];
-      }
+  openSettings() {
+    const setting = (this.app as AppWithSettings).setting;
+    if (setting) {
+      setting.open();
+      setting.openTabById(this.manifest.id);
     }
   }
 }
 
 class RandomMatrixView extends ItemView {
   plugin: RandomMatrixPlugin;
-  currentPick: PickResult | null = null;
+  /** Consecutive shuffles this session, to nudge towards just picking. */
+  private shuffles = 0;
 
-  constructor(leaf: any, plugin: RandomMatrixPlugin) {
+  constructor(leaf: WorkspaceLeaf, plugin: RandomMatrixPlugin) {
     super(leaf);
     this.plugin = plugin;
   }
@@ -743,225 +736,222 @@ class RandomMatrixView extends ItemView {
   }
 
   async onOpen() {
-    await this.refresh();
+    this.render();
   }
 
-  async refresh() {
-    this.containerEl.empty();
-    const root = this.containerEl.createDiv({ cls: "rmv-root" });
-    if (!this.currentPick && this.plugin.lastPick) {
-      this.currentPick = this.plugin.lastPick;
+  render() {
+    const root = this.contentEl;
+    root.empty();
+    root.addClass("rmv-root");
+    const plugin = this.plugin;
+
+    if (!plugin.matrixFolder()) {
+      const empty = root.createDiv({ cls: "rmv-empty" });
+      empty.createDiv({ text: "Choose the folder that holds your matrix notes." });
+      const button = empty.createEl("button", { text: "Open settings", cls: "mod-cta" });
+      button.onclick = () => plugin.openSettings();
+      return;
     }
-
-    const header = root.createDiv({ cls: "rmv-header" });
-    header.createEl("div", { text: "Random Matrix", cls: "rmv-title" });
-
-    const targetText = this.plugin.settings.targetFolder
-      ? this.plugin.settings.targetFolder
-      : "Set a target folder";
-    const targetRow = header.createDiv({ cls: "rmv-target-row" });
-    targetRow.createEl("span", { text: "Target", cls: "rmv-target-label" });
-    targetRow.createEl("span", { text: targetText, cls: "rmv-target" });
-
-    const actionsSection = root.createDiv({ cls: "rmv-section rmv-actions-section" });
-    actionsSection.createEl("div", { text: "Actions", cls: "rmv-section-title" });
-    const controls = actionsSection.createDiv({ cls: "rmv-actions" });
-    const mainRow = controls.createDiv({ cls: "rmv-actions-row" });
-    const statusRow = controls.createDiv({ cls: "rmv-actions-row" });
-    const utilityRow = controls.createDiv({ cls: "rmv-actions-row" });
-
-    const nextButton = mainRow.createEl("button", { text: "Next", cls: "rmv-btn rmv-btn-primary" });
-    nextButton.addEventListener("click", async () => {
-      const pick = await this.plugin.pickNext();
-      if (!pick) {
-        this.currentPick = null;
-        await this.renderStats(root);
-        return;
-      }
-      this.currentPick = pick;
-      await this.renderPick(root);
-      if (this.plugin.settings.autoOpenOnPick) {
-        await this.plugin.openNote(pick.note);
-      }
-    });
-
-    const openButton = mainRow.createEl("button", { text: "Open", cls: "rmv-btn" });
-    openButton.addEventListener("click", async () => {
-      if (!this.currentPick) {
-        return;
-      }
-      await this.plugin.openNote(this.currentPick.note);
-    });
-
-    const doneButton = statusRow.createEl("button", { text: "Done", cls: "rmv-btn" });
-    doneButton.addEventListener("click", async () => {
-      if (!this.currentPick) {
-        return;
-      }
-      await this.plugin.updateStatus(
-        this.currentPick.note.file,
-        this.plugin.settings.markCompletedValue
-      );
-    });
-
-    const progressButton = statusRow.createEl("button", { text: "In Progress", cls: "rmv-btn" });
-    progressButton.addEventListener("click", async () => {
-      if (!this.currentPick) {
-        return;
-      }
-      await this.plugin.updateStatus(
-        this.currentPick.note.file,
-        this.plugin.settings.markInProgressValue
-      );
-    });
-
-    const resetButton = statusRow.createEl("button", { text: "Not Started", cls: "rmv-btn" });
-    resetButton.addEventListener("click", async () => {
-      if (!this.currentPick) {
-        return;
-      }
-      await this.plugin.updateStatus(
-        this.currentPick.note.file,
-        this.plugin.settings.markNotStartedValue
-      );
-    });
-
-    const snoozeButton = utilityRow.createEl("button", { text: "Snooze", cls: "rmv-btn" });
-    snoozeButton.addEventListener("click", async () => {
-      if (!this.currentPick) {
-        return;
-      }
-      await this.plugin.snoozeNote(this.currentPick.note, this.plugin.settings.snoozeDays);
-      const next = await this.plugin.pickNext();
-      this.currentPick = next;
-      await this.renderPick(root);
-    });
-
-    const copyButton = utilityRow.createEl("button", { text: "Copy link", cls: "rmv-btn" });
-    copyButton.addEventListener("click", async () => {
-      if (!this.currentPick) {
-        return;
-      }
-      const link = this.plugin.app.fileManager.generateMarkdownLink(
-        this.currentPick.note.file,
-        ""
-      );
-      if (navigator?.clipboard?.writeText) {
-        await navigator.clipboard.writeText(link);
-        new Notice("Random Matrix: link copied.");
-      } else {
-        new Notice("Random Matrix: clipboard unavailable.");
-      }
-    });
-
-    const revealButton = utilityRow.createEl("button", { text: "Reveal", cls: "rmv-btn" });
-    revealButton.addEventListener("click", () => {
-      if (!this.currentPick) {
-        return;
-      }
-      this.plugin.revealInFileExplorer(this.currentPick.note.file);
-    });
-
-    await this.renderPick(root);
-    await this.renderStats(root);
-  }
-
-  async renderPick(root: HTMLElement) {
-    let pickSection = root.querySelector(".rmv-pick-section");
-    if (pickSection) {
-      pickSection.remove();
+    if (!plugin.indexed) {
+      root.createDiv({ text: "Indexing…", cls: "rmv-empty" });
+      return;
     }
-
-    pickSection = root.createDiv({ cls: "rmv-section rmv-pick-section" });
-    pickSection.createEl("div", { text: "Current pick", cls: "rmv-section-title" });
-    const pickCard = pickSection.createDiv({ cls: "rmv-pick-card" });
-
-    if (!this.currentPick) {
-      pickCard.createEl("div", { text: "Pick a condition to start.", cls: "rmv-empty" });
+    if (plugin.conditions.size === 0) {
+      root.createDiv({
+        text: `No notes with a "${plugin.settings.rankField}" field found in ${plugin.matrixFolder()}.`,
+        cls: "rmv-empty",
+      });
       return;
     }
 
-    const note = this.currentPick.note;
-    const header = pickCard.createDiv({ cls: "rmv-pick-header" });
-    header.createEl("div", { text: note.title, cls: "rmv-pick-title" });
+    const stats = plugin.stats();
+    this.renderFocus(root, stats);
 
-    const badges = header.createDiv({ cls: "rmv-badges" });
-    badges.createEl("span", { text: `Rank ${note.rank ?? "-"}`, cls: "rmv-badge rmv-badge-rank" });
-    const statusLabel = note.status || "no status";
-    badges.createEl("span", {
-      text: statusLabel,
-      cls: `rmv-badge rmv-badge-status rmv-status-${note.statusGroup}`,
-    });
-
-    const meta = pickCard.createDiv({ cls: "rmv-pick-meta" });
-    if (note.topic) {
-      meta.createEl("span", { text: note.topic, cls: "rmv-chip" });
-    }
-    if (note.subtopic) {
-      meta.createEl("span", { text: note.subtopic, cls: "rmv-chip" });
+    const current = plugin.currentCondition();
+    if (current) {
+      this.renderCurrent(root, current);
+    } else {
+      this.renderChoices(root);
     }
 
-    const lastSeen = this.plugin.data.lastSeen[note.path] ?? 0;
-    pickCard.createEl("div", {
-      text: `Last picked: ${formatRelativeTime(lastSeen)}`,
-      cls: "rmv-pick-last",
-    });
-
-    pickCard.createEl("div", { text: note.path, cls: "rmv-pick-path" });
-    pickCard.createEl("div", { text: this.currentPick.reason, cls: "rmv-pick-reason" });
+    this.renderProgress(root, stats);
   }
 
-  async renderStats(root: HTMLElement) {
-    let statsSection = root.querySelector(".rmv-stats-section");
-    if (statsSection) {
-      statsSection.remove();
+  private renderFocus(root: HTMLElement, stats: MatrixStats) {
+    const areas = this.plugin.areas();
+    if (areas.length < 2) {
+      return;
+    }
+    const focus = this.plugin.state.focus;
+    const row = root.createDiv({ cls: "rmv-focus" });
+
+    const all = row.createEl("button", { text: "All", cls: "rmv-chip" });
+    all.toggleClass("is-active", focus.length === 0);
+    all.onclick = () => this.setFocus([]);
+
+    for (const area of areas) {
+      const r1 = stats.byArea.get(area)?.[1];
+      const chip = row.createEl("button", { cls: "rmv-chip" });
+      chip.createSpan({ text: area });
+      if (r1 && r1.total > 0) {
+        chip.createSpan({ text: ` ${r1.done}/${r1.total}`, cls: "rmv-chip-count" });
+      }
+      chip.toggleClass("is-active", focus.includes(area));
+      chip.setAttr(
+        "aria-label",
+        "Rank 1 finished/total. Shift-click to combine with other rotations."
+      );
+      chip.onclick = (event) => {
+        if (event.shiftKey || event.metaKey || event.ctrlKey) {
+          const next = focus.includes(area)
+            ? focus.filter((a) => a !== area)
+            : [...focus, area];
+          this.setFocus(next);
+        } else {
+          this.setFocus(focus.length === 1 && focus[0] === area ? [] : [area]);
+        }
+      };
+    }
+  }
+
+  private setFocus(areas: string[]) {
+    this.plugin.state.focus = areas;
+    this.plugin.changed();
+  }
+
+  private renderCurrent(root: HTMLElement, c: Condition) {
+    const section = root.createDiv({ cls: "rmv-section" });
+    section.createDiv({ text: "Studying", cls: "rmv-label" });
+
+    const card = section.createDiv({ cls: "rmv-card rmv-card-current" });
+    this.renderConditionBody(card, c);
+    card.onclick = () => void this.plugin.openPath(c.path);
+
+    const opened = this.plugin.state.opened[c.path];
+    if (opened && Date.now() - opened > 12 * 60 * 60 * 1000) {
+      section.createDiv({ text: `Started ${formatAgo(opened)}`, cls: "rmv-hint" });
     }
 
-    const scan = await this.plugin.scanNotes();
-    statsSection = root.createDiv({ cls: "rmv-section rmv-stats-section" });
-    statsSection.createEl("div", { text: "Progress", cls: "rmv-section-title" });
+    const actions = section.createDiv({ cls: "rmv-actions" });
+    const done = actions.createEl("button", { text: "Finished", cls: "mod-cta" });
+    done.onclick = async () => {
+      const file = this.app.vault.getAbstractFileByPath(c.path);
+      if (file instanceof TFile) {
+        await this.plugin.markFinished(file);
+      }
+    };
+    const snooze = actions.createEl("button", { text: "Snooze" });
+    snooze.setAttr("aria-label", `Hide for ${formatDays(this.plugin.settings.snoozeDays)}`);
+    snooze.onclick = () => this.plugin.snooze(c.path);
+    const back = actions.createEl("button", { text: "Put back" });
+    back.setAttr("aria-label", "Stop for now and choose something else");
+    back.onclick = () => this.plugin.putBack();
+  }
 
-    const summary = statsSection.createDiv({ cls: "rmv-stats-summary" });
-    const remaining = Math.max(0, scan.stats.total - scan.stats.completed);
-    summary.createEl("div", { text: `Total: ${scan.stats.total}`, cls: "rmv-stat" });
-    summary.createEl("div", { text: `Eligible now: ${scan.stats.eligible}`, cls: "rmv-stat" });
-    summary.createEl("div", { text: `Remaining: ${remaining}`, cls: "rmv-stat" });
-    summary.createEl("div", { text: `Completed: ${scan.stats.completed}`, cls: "rmv-stat" });
+  private renderChoices(root: HTMLElement) {
+    const plugin = this.plugin;
+    const choices = plugin.choices();
+    const section = root.createDiv({ cls: "rmv-section" });
 
-    const completion = scan.stats.total > 0 ? scan.stats.completed / scan.stats.total : 0;
-    const progress = statsSection.createDiv({ cls: "rmv-progress" });
-    const progressBar = progress.createDiv({ cls: "rmv-progress-bar" });
-    const progressFill = progressBar.createDiv({ cls: "rmv-progress-fill" });
-    progressFill.style.width = `${Math.round(completion * 100)}%`;
-    progress.createEl("div", {
-      text: `${Math.round(completion * 100)}% complete`,
-      cls: "rmv-progress-label",
+    if (choices.length === 0) {
+      section.createDiv({
+        text: plugin.state.focus.length ? "Nothing left in this focus." : "Nothing left to pick.",
+        cls: "rmv-empty",
+      });
+      return;
+    }
+
+    section.createDiv({
+      text: choices.length > 1 ? "Pick one" : "Up next",
+      cls: "rmv-label",
     });
+    for (const c of choices) {
+      const card = section.createDiv({ cls: "rmv-card rmv-card-choice" });
+      this.renderConditionBody(card, c);
+      card.onclick = () => {
+        this.shuffles = 0;
+        void plugin.choose(c.path);
+      };
+    }
 
-    const rankGrid = statsSection.createDiv({ cls: "rmv-stats-grid" });
-    [1, 2, 3].forEach((rank) => {
-      const info = scan.stats.byRank[rank];
-      const cell = rankGrid.createDiv({ cls: "rmv-stats-cell" });
-      cell.createEl("div", { text: `Rank ${rank}`, cls: "rmv-stats-rank" });
-      cell.createEl("div", { text: `Remaining: ${info?.eligible ?? 0}`, cls: "rmv-stat" });
-      cell.createEl("div", { text: `Done: ${info?.completed ?? 0}`, cls: "rmv-stat" });
-      const rankPercent =
-        info && info.total > 0 ? Math.round((info.completed / info.total) * 100) : 0;
-      const rankProgress = cell.createDiv({ cls: "rmv-rank-progress" });
-      const rankFill = rankProgress.createDiv({ cls: "rmv-rank-progress-fill" });
-      rankFill.style.width = `${rankPercent}%`;
-      cell.createEl("div", { text: `${rankPercent}% complete`, cls: "rmv-rank-label" });
+    const actions = section.createDiv({ cls: "rmv-actions" });
+    const pick = actions.createEl("button", {
+      text: choices.length > 1 ? "Pick for me" : "Start",
     });
+    const shuffle = actions.createEl("button", { text: "Shuffle" });
+    // After a couple of shuffles, make the decision-free option the obvious one.
+    pick.toggleClass("mod-cta", this.shuffles >= 2 || choices.length === 1);
+    pick.onclick = () => {
+      this.shuffles = 0;
+      void plugin.pickForMe();
+    };
+    shuffle.onclick = () => {
+      this.shuffles += 1;
+      plugin.shuffle();
+    };
+    if (this.shuffles >= 2) {
+      section.createDiv({
+        text: "Any of these is a good use of the next hour.",
+        cls: "rmv-hint",
+      });
+    }
+  }
 
-    if (scan.stats.byStatus && Object.keys(scan.stats.byStatus).length > 0) {
-      const statusRow = statsSection.createDiv({ cls: "rmv-stats-status" });
-      Object.entries(scan.stats.byStatus)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 6)
-        .forEach(([status, count]) => {
-          statusRow.createEl("span", { text: `${status}: ${count}`, cls: "rmv-chip" });
+  private renderConditionBody(card: HTMLElement, c: Condition) {
+    const head = card.createDiv({ cls: "rmv-card-head" });
+    head.createSpan({ text: `R${c.rank}`, cls: `rmv-rank rmv-rank-${c.rank}` });
+    head.createSpan({ text: c.title, cls: "rmv-card-title" });
+
+    const meta = card.createDiv({ cls: "rmv-card-meta" });
+    const crumbs = [c.area, c.topic, c.subtopic].filter((s) => s && s.length > 0);
+    meta.createSpan({ text: crumbs.join(" › ") });
+    if (c.status === "in-progress") {
+      meta.createSpan({ text: "in progress", cls: "rmv-tag" });
+    }
+    const passes = this.plugin.state.passed[c.path]?.count ?? 0;
+    if (passes >= 3) {
+      meta.createSpan({ text: `skipped ${passes}×`, cls: "rmv-tag rmv-tag-muted" });
+    }
+  }
+
+  private renderProgress(root: HTMLElement, stats: MatrixStats) {
+    const plugin = this.plugin;
+    const plan = plugin.plan();
+    const section = root.createDiv({ cls: "rmv-section rmv-progress" });
+
+    for (const rank of RANKS) {
+      const s = stats.byRank[rank];
+      if (s.total === 0) {
+        continue;
+      }
+      const row = section.createDiv({ cls: `rmv-bar-row rmv-bar-row-${rank}` });
+      row.createSpan({ text: `R${rank}`, cls: `rmv-rank rmv-rank-${rank}` });
+      const bar = row.createDiv({ cls: "rmv-bar" });
+      bar.createDiv({ cls: "rmv-bar-fill" }).style.width = `${(100 * s.done) / s.total}%`;
+      row.createSpan({ text: `${s.done}/${s.total}`, cls: "rmv-bar-count" });
+    }
+
+    const pace = section.createDiv({ cls: "rmv-pace" });
+    pace.createSpan({ text: `${stats.today} today` });
+    pace.createSpan({ text: `${(stats.last7 / 7).toFixed(1)}/day this week` });
+
+    const r1Left = plan.remaining[1];
+    if (plan.daysLeft !== null) {
+      const need = r1Left / plan.daysLeft;
+      const line = section.createDiv({ cls: "rmv-pace" });
+      line.createSpan({ text: `${plan.daysLeft} days to exam` });
+      if (r1Left > 0) {
+        line.createSpan({
+          text: `${need.toFixed(1)}/day finishes rank 1`,
+          cls: need > plugin.settings.dailyTarget ? "rmv-warn" : "",
         });
+      }
+    } else {
+      const link = section.createDiv({ cls: "rmv-hint rmv-link" });
+      link.setText("Set an exam date to plan the rank mix →");
+      link.onclick = () => plugin.openSettings();
     }
+    section.createDiv({ text: plan.summary, cls: "rmv-hint" });
   }
 }
 
@@ -973,548 +963,148 @@ class RandomMatrixSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  private update(apply: () => void, reindex = false) {
+    apply();
+    if (reindex) {
+      this.plugin.rebuildIndex();
+    } else {
+      this.plugin.changed();
+    }
+  }
+
   display(): void {
     const { containerEl } = this;
+    const plugin = this.plugin;
+    const settings = plugin.settings;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Random Matrix" });
-
     new Setting(containerEl)
-      .setName("Target folder")
-      .setDesc("Folder to pull conditions from.")
+      .setName("Matrix folder")
+      .setDesc("Notes in here with a rank in their frontmatter are the matrix. The first level of subfolders become focus chips.")
       .addText((text) =>
         text
-          .setPlaceholder("Year 4C/GP")
-          .setValue(this.plugin.settings.targetFolder)
-          .onChange(async (value) => {
-            this.plugin.settings.targetFolder = value.trim();
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
+          .setPlaceholder("Year 4C")
+          .setValue(settings.matrixFolder)
+          .onChange((value) => this.update(() => (settings.matrixFolder = value.trim()), true))
       )
-      .addButton((button) => {
-        button.setButtonText("Browse");
-        button.onClick(() => {
-          const modal = new FolderSuggestModal(this.app, (folder) => {
-            this.plugin.settings.targetFolder = folder.path;
-            void this.plugin.savePluginData();
-            this.plugin.refreshView();
-            this.display();
-          });
-          modal.open();
-        });
-      })
-      .addButton((button) => {
-        button.setButtonText("Use current note");
-        button.onClick(async () => {
-          const file = this.app.workspace.getActiveFile();
-          if (!file?.parent) {
-            new Notice("Random Matrix: open a note to use its folder.");
-            return;
-          }
-          this.plugin.settings.targetFolder = file.parent.path;
-          await this.plugin.savePluginData();
-          this.plugin.refreshView();
-          this.display();
-        });
+      .addExtraButton((button) =>
+        button
+          .setIcon("folder")
+          .setTooltip("Browse")
+          .onClick(() => {
+            new FolderSuggestModal(this.app, (folder) => {
+              this.update(() => (settings.matrixFolder = folder.path), true);
+              this.display();
+            }).open();
+          })
+      );
+
+    new Setting(containerEl).setName("Exam plan").setHeading();
+
+    new Setting(containerEl)
+      .setName("Exam date")
+      .setDesc("With a date set, rank 2 and 3 only come up once rank 1 fits in the days left.")
+      .addText((text) => {
+        text.inputEl.type = "date";
+        text
+          .setValue(settings.examDate)
+          .onChange((value) => this.update(() => (settings.examDate = value)));
       });
 
     new Setting(containerEl)
-      .setName("Include subfolders")
-      .setDesc("Include notes in subfolders of the target folder.")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.includeSubfolders).onChange(async (value) => {
-          this.plugin.settings.includeSubfolders = value;
-          await this.plugin.savePluginData();
-          this.plugin.refreshView();
-        })
+      .setName("Conditions per day")
+      .setDesc("How many you can realistically finish on an average day. Sets how much fits before the exam.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(0.5, 15, 0.5)
+          .setDynamicTooltip()
+          .setValue(settings.dailyTarget)
+          .onChange((value) => this.update(() => (settings.dailyTarget = value)))
+      );
+
+    new Setting(containerEl).setName("Picking").setHeading();
+
+    new Setting(containerEl)
+      .setName("Choices offered")
+      .setDesc("How many options to show at once. 1 gives a single pick.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 5, 1)
+          .setDynamicTooltip()
+          .setValue(settings.choiceCount)
+          .onChange((value) =>
+            this.update(() => {
+              settings.choiceCount = value;
+              plugin.state.choices = plugin.state.choices.slice(0, value);
+            })
+          )
       );
 
     new Setting(containerEl)
-      .setName("Exclude path fragments")
-      .setDesc("One per line. Notes with matching path fragments are ignored.")
-      .addTextArea((text) => {
+      .setName("Rank 2 weight")
+      .setDesc("How likely a rank 2 note is relative to a rank 1 note, when there's room for both.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(0, 1, 0.05)
+          .setDynamicTooltip()
+          .setValue(settings.rank2Weight)
+          .onChange((value) => this.update(() => (settings.rank2Weight = value)))
+      );
+
+    new Setting(containerEl)
+      .setName("Rank 3 weight")
+      .addSlider((slider) =>
+        slider
+          .setLimits(0, 1, 0.05)
+          .setDynamicTooltip()
+          .setValue(settings.rank3Weight)
+          .onChange((value) => this.update(() => (settings.rank3Weight = value)))
+      );
+
+    new Setting(containerEl)
+      .setName("Snooze length (days)")
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 14, 1)
+          .setDynamicTooltip()
+          .setValue(settings.snoozeDays)
+          .onChange((value) => this.update(() => (settings.snoozeDays = value)))
+      );
+
+    new Setting(containerEl).setName("Frontmatter").setHeading();
+
+    const field = (name: string, key: "rankField" | "statusField" | "topicField" | "subtopicField" | "finishedValue" | "inProgressValue") =>
+      new Setting(containerEl).setName(name).addText((text) =>
         text
-          .setPlaceholder("Resource Directory.md")
-          .setValue(this.plugin.settings.excludePathFragments.join("\n"))
-          .onChange(async (value) => {
-            this.plugin.settings.excludePathFragments = value
-              .split(/\n|,/)
-              .map((item) => item.trim())
-              .filter((item) => item.length > 0);
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          });
-      });
-
-    containerEl.createEl("h3", { text: "Frontmatter fields" });
-
-    new Setting(containerEl)
-      .setName("Rank field")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.rankField)
-          .onChange(async (value) => {
-            this.plugin.settings.rankField = value.trim() || "rank";
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
+          .setPlaceholder(DEFAULT_SETTINGS[key])
+          .setValue(settings[key])
+          .onChange((value) =>
+            this.update(() => (settings[key] = value.trim() || DEFAULT_SETTINGS[key]), true)
+          )
       );
-
-    new Setting(containerEl)
-      .setName("Status field")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.statusField)
-          .onChange(async (value) => {
-            this.plugin.settings.statusField = value.trim() || "status";
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Topic field")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.topicField)
-          .onChange(async (value) => {
-            this.plugin.settings.topicField = value.trim() || "topic";
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Subtopic field")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.subtopicField)
-          .onChange(async (value) => {
-            this.plugin.settings.subtopicField = value.trim() || "subtopic";
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
-      );
-
-    containerEl.createEl("h3", { text: "Status values" });
-
-    new Setting(containerEl)
-      .setName("Completed statuses")
-      .setDesc("Comma or line separated.")
-      .addTextArea((text) =>
-        text
-          .setValue(this.plugin.settings.completedStatuses.join("\n"))
-          .onChange(async (value) => {
-            this.plugin.settings.completedStatuses = normalizeList(
-              value.split(/\n|,/).map((item) => item.trim())
-            );
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Not started statuses")
-      .setDesc("Used for weighting.")
-      .addTextArea((text) =>
-        text
-          .setValue(this.plugin.settings.notStartedStatuses.join("\n"))
-          .onChange(async (value) => {
-            this.plugin.settings.notStartedStatuses = normalizeList(
-              value.split(/\n|,/).map((item) => item.trim())
-            );
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("In progress statuses")
-      .setDesc("Used for weighting.")
-      .addTextArea((text) =>
-        text
-          .setValue(this.plugin.settings.inProgressStatuses.join("\n"))
-          .onChange(async (value) => {
-            this.plugin.settings.inProgressStatuses = normalizeList(
-              value.split(/\n|,/).map((item) => item.trim())
-            );
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Mark completed value")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.markCompletedValue)
-          .onChange(async (value) => {
-            const nextValue = normalizeStatus(value);
-            this.plugin.settings.markCompletedValue = nextValue || FINISHED_STATUS;
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Mark in progress value")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.markInProgressValue)
-          .onChange(async (value) => {
-            this.plugin.settings.markInProgressValue = value.trim() || "in-progress";
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Mark not started value")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.markNotStartedValue)
-          .onChange(async (value) => {
-            this.plugin.settings.markNotStartedValue = value.trim() || "not-started";
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Treat missing status as not started")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.treatMissingStatusAsNotStarted).onChange(async (value) => {
-          this.plugin.settings.treatMissingStatusAsNotStarted = value;
-          await this.plugin.savePluginData();
-          this.plugin.refreshView();
-        })
-      );
-
-    containerEl.createEl("h3", { text: "Rank behavior" });
-
-    new Setting(containerEl)
-      .setName("Include unranked notes")
-      .setDesc("If enabled, notes without a rank use the fallback rank.")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.includeUnranked).onChange(async (value) => {
-          this.plugin.settings.includeUnranked = value;
-          await this.plugin.savePluginData();
-          this.plugin.refreshView();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Fallback rank for unranked")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.unrankedRank))
-          .onChange(async (value) => {
-            const parsed = parseNumber(value, 3);
-            this.plugin.settings.unrankedRank = Math.max(1, Math.min(3, Math.round(parsed)));
-            await this.plugin.savePluginData();
-            this.plugin.refreshView();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Rank 2 scatter base")
-      .setDesc("Base chance to pick rank 2 when rank 1 remains.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.rank2ScatterBase))
-          .onChange(async (value) => {
-            this.plugin.settings.rank2ScatterBase = clamp(parseNumber(value, 0.15), 0, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Rank 2 scatter boost")
-      .setDesc("Added chance as rank 1 completion increases.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.rank2ScatterBoost))
-          .onChange(async (value) => {
-            this.plugin.settings.rank2ScatterBoost = clamp(parseNumber(value, 0.35), 0, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Rank 2 scatter max")
-      .setDesc("Upper limit for rank 2 scatter chance.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.rank2ScatterMax))
-          .onChange(async (value) => {
-            this.plugin.settings.rank2ScatterMax = clamp(parseNumber(value, 0.6), 0, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Rank 3 scatter base")
-      .setDesc("Base chance to pick rank 3 when higher ranks remain.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.rank3ScatterBase))
-          .onChange(async (value) => {
-            this.plugin.settings.rank3ScatterBase = clamp(parseNumber(value, 0.03), 0, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Rank 3 scatter boost")
-      .setDesc("Added chance as higher ranks complete.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.rank3ScatterBoost))
-          .onChange(async (value) => {
-            this.plugin.settings.rank3ScatterBoost = clamp(parseNumber(value, 0.1), 0, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Rank 3 scatter max")
-      .setDesc("Upper limit for rank 3 scatter chance.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.rank3ScatterMax))
-          .onChange(async (value) => {
-            this.plugin.settings.rank3ScatterMax = clamp(parseNumber(value, 0.2), 0, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    containerEl.createEl("h3", { text: "Heuristic weights" });
-
-    new Setting(containerEl)
-      .setName("Not started weight")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.notStartedWeight))
-          .onChange(async (value) => {
-            this.plugin.settings.notStartedWeight = parseNumber(value, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("In progress weight")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.inProgressWeight))
-          .onChange(async (value) => {
-            this.plugin.settings.inProgressWeight = parseNumber(value, 0.7);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Unknown status weight")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.unknownStatusWeight))
-          .onChange(async (value) => {
-            this.plugin.settings.unknownStatusWeight = parseNumber(value, 0.85);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Exclude recent picks")
-      .setDesc("Number of most recent picks to exclude entirely.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.excludeRecentCount))
-          .onChange(async (value) => {
-            this.plugin.settings.excludeRecentCount = Math.max(0, Math.floor(parseNumber(value, 5)));
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Recent penalty")
-      .setDesc("Penalty applied for older history items. 1 means no penalty.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.recentPenalty))
-          .onChange(async (value) => {
-            this.plugin.settings.recentPenalty = clamp(parseNumber(value, 0.35), 0.01, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("History limit")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.historyLimit))
-          .onChange(async (value) => {
-            this.plugin.settings.historyLimit = Math.max(10, Math.floor(parseNumber(value, 200)));
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Staleness days")
-      .setDesc("Days until a note gets full staleness boost.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.stalenessDays))
-          .onChange(async (value) => {
-            this.plugin.settings.stalenessDays = Math.max(0, parseNumber(value, 14));
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Max staleness boost")
-      .setDesc("Maximum multiplier added for stale notes.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.maxStalenessBoost))
-          .onChange(async (value) => {
-            this.plugin.settings.maxStalenessBoost = Math.max(0, parseNumber(value, 1));
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Diversity window")
-      .setDesc("Avoid repeating recent topics within this many picks.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.diversityWindow))
-          .onChange(async (value) => {
-            this.plugin.settings.diversityWindow = Math.max(0, Math.floor(parseNumber(value, 3)));
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Same topic penalty")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.sameTopicPenalty))
-          .onChange(async (value) => {
-            this.plugin.settings.sameTopicPenalty = clamp(parseNumber(value, 0.7), 0.01, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Same subtopic penalty")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.sameSubtopicPenalty))
-          .onChange(async (value) => {
-            this.plugin.settings.sameSubtopicPenalty = clamp(parseNumber(value, 0.8), 0.01, 1);
-            await this.plugin.savePluginData();
-          })
-      );
-
-    containerEl.createEl("h3", { text: "Quality of life" });
-
-    new Setting(containerEl)
-      .setName("Snooze days")
-      .setDesc("How long Snooze hides a note.")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.snoozeDays))
-          .onChange(async (value) => {
-            this.plugin.settings.snoozeDays = Math.max(0, parseNumber(value, 1));
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Auto open on pick")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.autoOpenOnPick).onChange(async (value) => {
-          this.plugin.settings.autoOpenOnPick = value;
-          await this.plugin.savePluginData();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Open in new leaf")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.openInNewLeaf).onChange(async (value) => {
-          this.plugin.settings.openInNewLeaf = value;
-          await this.plugin.savePluginData();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Auto mark in progress on open")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.autoMarkInProgressOnOpen).onChange(async (value) => {
-          this.plugin.settings.autoMarkInProgressOnOpen = value;
-          await this.plugin.savePluginData();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Reveal in file explorer on open")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.revealInFileExplorer).onChange(async (value) => {
-          this.plugin.settings.revealInFileExplorer = value;
-          await this.plugin.savePluginData();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Write last reviewed to frontmatter")
-      .setDesc("Writes a timestamp whenever a note is opened or marked.")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.writeLastReviewed).onChange(async (value) => {
-          this.plugin.settings.writeLastReviewed = value;
-          await this.plugin.savePluginData();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Last reviewed field")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.lastReviewedField)
-          .onChange(async (value) => {
-            this.plugin.settings.lastReviewedField = value.trim() || "last-reviewed";
-            await this.plugin.savePluginData();
-          })
-      );
-
-    containerEl.createEl("h3", { text: "Help" });
-    const help = containerEl.createDiv({ cls: "rmv-settings-help" });
-    help.createEl("p", {
-      text:
-        "Next picks a new condition using rank + progress heuristics. Open opens the current pick. Done/In Progress/Not Started update the note status. Snooze hides the pick for a few days. Copy link copies a wiki link. Reveal focuses the file in the explorer.",
-    });
-    help.createEl("p", {
-      text:
-        "Daily flow: open the panel, hit Next, study the note, mark In Progress or Done, and repeat. Snooze anything you cannot tackle today. Use the target folder to switch rotations fast.",
-    });
+    field("Rank field", "rankField");
+    field("Status field", "statusField");
+    field("Topic field", "topicField");
+    field("Subtopic field", "subtopicField");
+    field("Finished status value", "finishedValue");
+    field("In progress status value", "inProgressValue");
   }
 }
 
 class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
-  onChoose: (folder: TFolder) => void;
-
-  constructor(app: App, onChoose: (folder: TFolder) => void) {
+  constructor(app: App, private onChoose: (folder: TFolder) => void) {
     super(app);
-    this.onChoose = onChoose;
     this.setPlaceholder("Select a folder");
   }
 
   getItems(): TFolder[] {
     return this.app.vault
       .getAllLoadedFiles()
-      .filter((file): file is TFolder => file instanceof TFolder);
+      .filter((file): file is TFolder => file instanceof TFolder && !file.isRoot());
   }
 
   getItemText(item: TFolder): string {
-    return item.path || "/";
+    return item.path;
   }
 
   onChooseItem(item: TFolder): void {
@@ -1522,76 +1112,50 @@ class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
   }
 }
 
-function normalizeTargetFolder(value: string): string {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return "";
+function parseRank(value: unknown): Rank | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? parseInt(value, 10) : NaN;
+  if (!Number.isFinite(n)) {
+    return null;
   }
-  return normalizePath(trimmed);
+  return Math.max(1, Math.min(3, Math.round(n))) as Rank;
 }
 
-function normalizeStatus(value: unknown): string {
-  if (typeof value !== "string") {
-    return "";
-  }
-  return value.trim().toLowerCase();
-}
-
-function normalizeString(value: unknown): string {
+function asString(value: unknown): string {
   if (typeof value === "string") {
     return value.trim();
   }
-  if (value === null || value === undefined) {
-    return "";
+  if (typeof value === "number") {
+    return String(value);
   }
-  return String(value);
+  return "";
 }
 
-function normalizeList(values: string[]): string[] {
-  return values
-    .map((value) => value.trim().toLowerCase())
-    .filter((value) => value.length > 0);
+function sameCondition(a: Condition | null, b: Condition | null): boolean {
+  if (!a || !b) {
+    return a === b;
+  }
+  return (
+    a.title === b.title &&
+    a.rank === b.rank &&
+    a.status === b.status &&
+    a.area === b.area &&
+    a.topic === b.topic &&
+    a.subtopic === b.subtopic
+  );
 }
 
-function clamp(value: number, min: number, max: number): number {
-  if (Number.isNaN(value)) {
-    return min;
-  }
-  return Math.min(max, Math.max(min, value));
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.round(value)));
 }
 
-function parseNumber(value: string, fallback: number): number {
-  const parsed = Number(value);
-  if (Number.isNaN(parsed)) {
-    return fallback;
-  }
-  return parsed;
+function formatDays(days: number): string {
+  return days === 1 ? "1 day" : `${days} days`;
 }
 
-function formatRelativeTime(ts: number): string {
-  if (!ts) {
-    return "never";
+function formatAgo(ts: number): string {
+  const days = Math.floor((Date.now() - ts) / DAY_MS);
+  if (days < 1) {
+    return "today";
   }
-  const diff = Date.now() - ts;
-  if (diff < 60_000) {
-    return "just now";
-  }
-  const minutes = Math.floor(diff / 60_000);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-  const days = Math.floor(hours / 24);
-  if (days < 14) {
-    return `${days}d ago`;
-  }
-  const weeks = Math.floor(days / 7);
-  if (weeks < 8) {
-    return `${weeks}w ago`;
-  }
-  const months = Math.floor(days / 30);
-  return `${months}mo ago`;
+  return days === 1 ? "yesterday" : `${days} days ago`;
 }
