@@ -233,3 +233,59 @@
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
 }
+
+/* Trinity */
+
+.rmv-brief {
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  line-height: 1.4;
+}
+
+.rmv-card-score {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+}
+
+.rmv-action {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: var(--radius-s);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+
+.rmv-action-fix {
+  background: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+
+.rmv-action-drill,
+.rmv-action-check {
+  background: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+
+.rmv-action-learn,
+.rmv-action-finish {
+  background: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+.rmv-insight {
+  padding-left: 8px;
+  border-left: 2px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+}
+
+.rmv-practise {
+  align-self: flex-start;
+  margin-top: 4px;
+  font-size: var(--font-ui-smaller);
+}

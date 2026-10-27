@@ -32,6 +32,16 @@ If a focused rotation has fewer than five notes in the plan, or the plan's remai
 
 Finished notes and snoozed notes are never offered. Completions are logged whenever a note's status changes to finished, however you change it (the panel, a command, the properties view, or sync from another device).
 
+### Trinity
+
+With a Trinity API key (Trinity → Settings → API keys) in the plugin's settings, the matrix syncs to Trinity a few seconds after anything changes (statuses, opens, passes, snoozes, the exam date). Trinity maps every past-paper question onto your matrix notes (Monash papers from the exam-yield mapping, other banks by Claude) and estimates, from your answers and each note's status, how likely you are to get its exam questions right. In return:
+
+- **Weighted picks**: a note's chance of coming up is multiplied by how weak Trinity says you are on it (up to 3× for a weak one, down to ⅓ for a well-known one, half again with recent misses).
+- **Trinity section** in the panel: the share of matrix exam marks you're expected to get now, after today's plan and by the exam at your daily goal; Claude's headline for the day; and Trinity's top three picks, ranked by exam marks gained per minute, each with its action (**Fix** recent misses, **Drill** an unwritten topic from its past-paper questions, **Learn**, **Finish**, **Check**) and a one-line reason. Tap one to study it; **Practise** starts its questions in the Trinity app (or on the web; see settings).
+- **Studying** card: how well you know the current note, the facts behind the questions you missed on it, and a **Practise** button.
+
+The same picks show on Trinity's Home screen, search page and Study Next widget.
+
 ## Commands
 
 - **Pick for me and open**: opens your current note, or picks one of the choices.
@@ -47,6 +57,7 @@ Finished notes and snoozed notes are never offered. Completions are logged whene
 - **Choices offered**: 1–5. Set to 1 for a single pick.
 - **Prioritise by exam yield**: on by default; uses `exam_yield` when notes have it.
 - **Rank 2 / Rank 3 weight** (used without exam yield), **Snooze length**
+- **Trinity**: API key, server, and whether questions open in the Trinity app or on the web.
 - **Frontmatter**: field names for rank, status, topic and subtopic, and the status values written for finished and in progress. `finished`, `done`, `complete`, `completed` and `mastered` all count as finished. The exam yield field name is configurable too.
 
 ## Development
@@ -59,6 +70,7 @@ pnpm run build  # production build to main.js
 
 - `main.ts`: plugin, panel view, settings, and the note index (kept in sync with the metadata cache).
 - `src/engine.ts`: the picking logic, with no Obsidian imports, so it can be run from Node.
+- `src/trinity.ts`: the Trinity client (matrix sync, compass, practice sessions) and the mastery weighting.
 - `styles.css`: panel styles.
 
 Pushing a new `manifest.json` version to `main` builds a GitHub release, which BRAT picks up.

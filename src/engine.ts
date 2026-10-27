@@ -322,6 +322,8 @@ export interface WeightContext {
   state: PickState;
   recent: { topics: Set<string>; subtopics: Set<string> };
   now: number;
+  /** Extra weight from outside the vault, e.g. how well Trinity says the condition is known. */
+  boost?: (c: Condition) => number;
 }
 
 /** Unnormalised probability of drawing this condition. */
@@ -351,6 +353,9 @@ export function weightOf(c: Condition, ctx: WeightContext): number {
   const sk = subtopicKey(c);
   if (sk && ctx.recent.subtopics.has(sk)) {
     w *= RECENT_SUBTOPIC_PENALTY;
+  }
+  if (ctx.boost) {
+    w *= ctx.boost(c);
   }
   return w;
 }

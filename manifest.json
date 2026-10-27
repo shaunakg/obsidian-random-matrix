@@ -1,9 +1,9 @@
 {
   "id": "obsidian-random-matrix",
   "name": "Random Matrix",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minAppVersion": "1.4.0",
-  "description": "Takes the decision out of what to study next: offers a few weighted picks from your matrix notes, paced to your exam date.",
+  "description": "Takes the decision out of what to study next: weighted picks from your matrix notes, paced to your exam date, and (with Trinity) weighted by how well your answers say you know each one.",
   "author": "shaunakg",
   "isDesktopOnly": false
 }

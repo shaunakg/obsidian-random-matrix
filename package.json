@@ -1,6 +1,6 @@
 {
   "name": "obsidian-random-matrix",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "scripts": {
     "build": "node esbuild.config.mjs",

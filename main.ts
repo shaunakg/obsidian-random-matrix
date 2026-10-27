@@ -33,6 +33,16 @@ import {
   weightOf,
   weightedIndex,
 } from "./src/engine";
+import {
+  ACTION_LABELS,
+  Anticipation,
+  ConditionState,
+  MatrixPayload,
+  Pick,
+  TrinityClient,
+  masteryBoost,
+  sessionUrl,
+} from "./src/trinity";
 
 const VIEW_TYPE = "random-matrix-view";
 const FINISHED_STATUSES = ["finished", "done", "complete", "completed", "mastered"];
@@ -42,6 +52,8 @@ const EXAM_TIER_FIELD = "exam_rank";
 const EXAM_SITTINGS_FIELD = "exam_sittings";
 /** Coverage the pace line aims for: past this, extra notes add little. */
 const COVERAGE_TARGET = 0.8;
+/** How often the compass is refetched while Obsidian is open (answers in Trinity move it). */
+const TRINITY_REFRESH_MS = 10 * 60 * 1000;
 
 interface RandomMatrixSettings {
   matrixFolder: string;
@@ -60,6 +72,11 @@ interface RandomMatrixSettings {
   finishedValue: string;
   inProgressValue: string;
   examYieldField: string;
+
+  /** Trinity backend and a personal API key (Trinity → Settings → API keys). */
+  trinityUrl: string;
+  trinityKey: string;
+  openQuestionsIn: "app" | "web";
 }
 
 interface RandomMatrixState {
@@ -135,6 +152,10 @@ const DEFAULT_SETTINGS: RandomMatrixSettings = {
   finishedValue: "finished",
   inProgressValue: "in-progress",
   examYieldField: "exam_yield",
+
+  trinityUrl: "https://search.a.srg.id.au",
+  trinityKey: "",
+  openQuestionsIn: "app",
 };
 
 function defaultState(): RandomMatrixState {
@@ -157,6 +178,14 @@ export default class RandomMatrixPlugin extends Plugin {
 
   private requestSave = debounce(() => void this.persist(), 500, true);
   private requestRender = debounce(() => this.renderViews(), 150, true);
+  private requestSync = debounce(() => void this.syncTrinity(), 3000, true);
+
+  /** Trinity's view of the matrix, when connected. */
+  trinityState = new Map<string, ConditionState>();
+  anticipation: Anticipation | null = null;
+  currentPick: Pick | null = null;
+  trinityError: string | null = null;
+  private lastSync = "";
 
   async onload() {
     await this.loadPluginData();
@@ -180,6 +209,7 @@ export default class RandomMatrixPlugin extends Plugin {
       this.app.vault.on("rename", (file, oldPath) => this.onFileRenamed(file, oldPath))
     );
     this.registerEvent(this.app.vault.on("delete", (file) => this.onFileDeleted(file)));
+    this.registerInterval(window.setInterval(() => void this.refreshTrinity(), TRINITY_REFRESH_MS));
   }
 
   private registerCommands() {
@@ -290,10 +320,13 @@ export default class RandomMatrixPlugin extends Plugin {
     await this.saveData(data);
   }
 
-  /** Save soon and redraw the panel. */
+  /** Save soon, redraw the panel and tell Trinity. */
   changed() {
     this.requestSave();
     this.requestRender();
+    if (this.indexed && this.trinity()) {
+      this.requestSync();
+    }
   }
 
   private pruneState(now: number) {
@@ -550,6 +583,7 @@ export default class RandomMatrixPlugin extends Plugin {
       state: this.state,
       recent: recentTopics(this.state, (p) => this.conditions.get(p)),
       now,
+      boost: (c: Condition) => masteryBoost(this.trinityState.get(c.path)),
     };
     let candidates = scoped.filter((c) => isAvailable(c, this.state, now));
     if (candidates.length === 0) {
@@ -594,7 +628,20 @@ export default class RandomMatrixPlugin extends Plugin {
     this.state.choices = [];
     this.state.current = path;
     this.state.opened[path] = now;
+    this.currentPick = null;
     this.changed();
+    await this.openPath(path);
+  }
+
+  /** Study a note Trinity suggested, without passing over the choices on offer. */
+  async studyThis(path: string) {
+    const c = this.conditions.get(path);
+    if (c && c.status !== "finished") {
+      this.state.current = path;
+      this.state.opened[path] = Date.now();
+      this.currentPick = null;
+      this.changed();
+    }
     await this.openPath(path);
   }
 
@@ -714,6 +761,105 @@ export default class RandomMatrixPlugin extends Plugin {
   }
 
   // ---------------------------------------------------------------------------
+  // Trinity
+
+  trinity(): TrinityClient | null {
+    const key = this.settings.trinityKey.trim();
+    return key ? new TrinityClient(this.settings.trinityUrl.trim() || DEFAULT_SETTINGS.trinityUrl, key) : null;
+  }
+
+  private matrixPayload(): MatrixPayload {
+    const s = this.state;
+    const seconds = (ms: number | undefined) => (ms ? ms / 1000 : null);
+    return {
+      vault: this.app.vault.getName(),
+      folder: this.matrixFolder(),
+      examDate: this.settings.examDate || null,
+      conditions: [...this.conditions.values()].map((c) => ({
+        path: c.path,
+        title: c.title,
+        discipline: c.area,
+        topic: c.topic,
+        subtopic: c.subtopic,
+        matrixRank: c.rank,
+        examRank: c.examTier,
+        examYield: c.examYield ?? 0,
+        examSittings: c.examSittings,
+        status: c.status,
+        completedAt: seconds(s.completedAt[c.path]),
+        openedAt: seconds(s.opened[c.path]),
+        passedAt: seconds(s.passed[c.path]?.ts),
+        snoozedUntil: seconds(s.snoozedUntil[c.path]),
+      })),
+    };
+  }
+
+  /** Send the matrix if it changed since the last sync, then refresh the compass. */
+  async syncTrinity() {
+    const client = this.trinity();
+    if (!client || !this.indexed || this.conditions.size === 0) {
+      return;
+    }
+    const payload = this.matrixPayload();
+    const signature = JSON.stringify(payload);
+    try {
+      if (signature !== this.lastSync) {
+        await client.syncMatrix(payload);
+        this.lastSync = signature;
+      }
+      await this.refreshTrinity();
+    } catch (error) {
+      this.trinityFailed(error);
+    }
+  }
+
+  async refreshTrinity() {
+    const client = this.trinity();
+    if (!client) {
+      return;
+    }
+    if (!this.lastSync) {
+      // Nothing sent yet this session; syncing refreshes afterwards.
+      await this.syncTrinity();
+      return;
+    }
+    try {
+      const current = this.state.current;
+      const [state, anticipation, pick] = await Promise.all([
+        client.matrixState(),
+        client.anticipate(),
+        current ? client.condition(current).catch(() => null) : Promise.resolve(null),
+      ]);
+      this.trinityState = state;
+      this.anticipation = anticipation;
+      this.currentPick = pick;
+      this.trinityError = null;
+      this.requestRender();
+    } catch (error) {
+      this.trinityFailed(error);
+    }
+  }
+
+  private trinityFailed(error: unknown) {
+    this.trinityError = error instanceof Error ? error.message : String(error);
+    this.requestRender();
+  }
+
+  /** Start a practice session of a condition's questions and open it in Trinity. */
+  async practise(pick: Pick) {
+    const client = this.trinity();
+    if (!client || pick.practice.questionIds.length === 0) {
+      return;
+    }
+    try {
+      const id = await client.startSession(pick.practice.questionIds);
+      window.open(sessionUrl(id, this.settings.openQuestionsIn));
+    } catch (error) {
+      new Notice(`Trinity: couldn't start the questions (${error instanceof Error ? error.message : error}).`);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Views
 
   async activateView() {
@@ -799,6 +945,7 @@ class RandomMatrixView extends ItemView {
 
     const stats = plugin.stats();
     this.renderFocus(root, stats);
+    this.renderTrinity(root);
 
     const current = plugin.currentCondition();
     if (current) {
@@ -853,6 +1000,74 @@ class RandomMatrixView extends ItemView {
     }
   }
 
+  private renderTrinity(root: HTMLElement) {
+    const plugin = this.plugin;
+    if (!plugin.trinity()) {
+      return;
+    }
+    const section = root.createDiv({ cls: "rmv-section rmv-trinity" });
+    section.createDiv({ text: "Trinity", cls: "rmv-label" });
+    const a = plugin.anticipation;
+    if (!a) {
+      section.createDiv({
+        text: plugin.trinityError ? `Couldn't reach Trinity: ${plugin.trinityError}` : "Syncing…",
+        cls: plugin.trinityError ? "rmv-hint rmv-warn" : "rmv-hint",
+      });
+      return;
+    }
+    if (a.readiness) {
+      const r = a.readiness;
+      const row = section.createDiv({ cls: "rmv-bar-row rmv-bar-row-exam" });
+      row.createSpan({ text: "Now", cls: "rmv-rank" });
+      const bar = row.createDiv({ cls: "rmv-bar" });
+      bar.createDiv({ cls: "rmv-bar-fill" }).style.width = `${100 * r.projected}%`;
+      row.createSpan({ text: formatPercent(r.projected), cls: "rmv-bar-count" });
+      row.setAttr("aria-label", "Expected share of matrix exam marks, from your answers in Trinity and your notes");
+      const outlook = [`${formatPercent(r.afterPlan)} after today's plan`];
+      if (r.beforeExam !== null) {
+        outlook.push(`${formatPercent(r.beforeExam)} by the exam at your daily goal`);
+      }
+      section.createDiv({ text: outlook.join(" · "), cls: "rmv-hint" });
+    }
+    if (a.brief) {
+      section.createDiv({ text: a.brief.headline, cls: "rmv-brief" });
+    }
+    for (const pick of a.next.slice(0, 3)) {
+      const card = section.createDiv({ cls: "rmv-card rmv-card-choice" });
+      const head = card.createDiv({ cls: "rmv-card-head" });
+      head.createSpan({ text: ACTION_LABELS[pick.action], cls: `rmv-action rmv-action-${pick.action}` });
+      head.createSpan({ text: pick.title, cls: "rmv-card-title" });
+      head.createSpan({ text: formatPercent(pick.mastery), cls: "rmv-card-score" }).setAttr(
+        "aria-label",
+        `Expected to get ${formatPercent(pick.mastery)} of its exam questions right`
+      );
+      card.createDiv({ text: pick.coach ?? pick.reason, cls: "rmv-card-meta" });
+      card.onclick = () => void plugin.studyThis(pick.path);
+      this.renderPractise(card, pick);
+    }
+    if (plugin.trinityError) {
+      section.createDiv({ text: `Last refresh failed: ${plugin.trinityError}`, cls: "rmv-hint rmv-warn" });
+    }
+  }
+
+  private renderPractise(container: HTMLElement, pick: Pick) {
+    const count = pick.practice.questionIds.length;
+    if (count === 0 || pick.action === "learn" || pick.action === "finish") {
+      return;
+    }
+    const button = container.createEl("button", { text: `Practise ${count} in Trinity`, cls: "rmv-practise" });
+    const parts = [`${pick.practice.total} questions on this`];
+    if (pick.practice.missed) {
+      parts.push(`${pick.practice.missed} missed`);
+    }
+    parts.push(`${pick.practice.unseen} unseen`);
+    button.setAttr("aria-label", parts.join(" · "));
+    button.onclick = (event) => {
+      event.stopPropagation();
+      void this.plugin.practise(pick);
+    };
+  }
+
   private setFocus(areas: string[]) {
     this.plugin.state.focus = areas;
     this.plugin.changed();
@@ -869,6 +1084,24 @@ class RandomMatrixView extends ItemView {
     const opened = this.plugin.state.opened[c.path];
     if (opened && Date.now() - opened > 12 * 60 * 60 * 1000) {
       section.createDiv({ text: `Started ${formatAgo(opened)}`, cls: "rmv-hint" });
+    }
+
+    const pick = this.plugin.currentPick?.path === c.path ? this.plugin.currentPick : null;
+    if (pick) {
+      const facts = [`${formatPercent(pick.mastery)} expected`];
+      if (pick.answered) {
+        facts.push(`${pick.answered} answered`);
+      }
+      if (pick.misses.length) {
+        facts.push(`${pick.misses.length} missed lately`);
+      }
+      section.createDiv({ text: `Trinity: ${facts.join(" · ")}`, cls: "rmv-hint" });
+      for (const miss of pick.misses) {
+        if (miss.insight) {
+          section.createDiv({ text: miss.insight, cls: "rmv-insight" });
+        }
+      }
+      this.renderPractise(section, pick);
     }
 
     const actions = section.createDiv({ cls: "rmv-actions" });
@@ -1141,6 +1374,46 @@ class RandomMatrixSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .setValue(settings.snoozeDays)
           .onChange((value) => this.saveSetting(() => (settings.snoozeDays = value)))
+      );
+
+    new Setting(containerEl).setName("Trinity").setHeading();
+
+    new Setting(containerEl)
+      .setName("API key")
+      .setDesc(
+        "A personal key from Trinity (Settings → API keys). The matrix syncs to Trinity, which weights picks by how well your answers say you know each condition, and suggests what to do next."
+      )
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setPlaceholder("trn_…")
+          .setValue(settings.trinityKey)
+          .onChange((value) =>
+            this.saveSetting(() => {
+              settings.trinityKey = value.trim();
+              plugin.anticipation = null;
+              plugin.trinityState.clear();
+            })
+          );
+      });
+
+    new Setting(containerEl)
+      .setName("Server")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.trinityUrl)
+          .setValue(settings.trinityUrl)
+          .onChange((value) => this.saveSetting(() => (settings.trinityUrl = value.trim() || DEFAULT_SETTINGS.trinityUrl)))
+      );
+
+    new Setting(containerEl)
+      .setName("Open questions in")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("app", "Trinity app")
+          .addOption("web", "Trinity on the web")
+          .setValue(settings.openQuestionsIn)
+          .onChange((value) => this.saveSetting(() => (settings.openQuestionsIn = value === "web" ? "web" : "app")))
       );
 
     new Setting(containerEl).setName("Frontmatter").setHeading();
